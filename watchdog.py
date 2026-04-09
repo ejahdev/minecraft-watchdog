@@ -1,4 +1,4 @@
-import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac
+import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac, zipfile
 from functools import wraps
 from mcstatus import JavaServer
 import psutil
@@ -237,7 +237,8 @@ class ServerInstance:
         self.ready_event      = threading.Event()
         self.restart_event    = threading.Event()
         self.crash_times      = []
-        self.last_backup_time = None
+        self.last_backup_time = time.time()
+        self.save_done_event  = threading.Event()
         self._last_cmd_time   = 0.0
         self._mc_server       = None
 
@@ -279,6 +280,8 @@ class ServerInstance:
             except Exception: continue
             if DONE_RE.search(line):
                 self.ready_event.set()
+            if "Saved the game" in line:
+                self.save_done_event.set()
             with self.state_lock:
                 self.state["log"].append(line)
                 if len(self.state["log"]) > 500: self.state["log"].pop(0)
@@ -316,11 +319,48 @@ class ServerInstance:
         backup_dir = os.path.join(self.server_dir, self.scfg["backup_dir"])
         world_dir  = os.path.join(self.server_dir, self.scfg["world_dir"])
         os.makedirs(backup_dir, exist_ok=True)
-        ts    = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        fname = f"world_{ts}"
-        shutil.make_archive(os.path.join(backup_dir, fname), "zip", world_dir)
-        self.last_backup_time = time.time()
-        self._log("BACKUP", f"{fname}.zip created")
+        ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        fname    = f"world_{ts}.zip"
+        zip_path = os.path.join(backup_dir, fname)
+
+        server_running = self.state.get("status") == "online" and self.proc and self.proc.poll() is None
+        if server_running:
+            try:
+                self.save_done_event.clear()
+                self.proc.stdin.write(b"save-off\n"); self.proc.stdin.flush()
+                self.proc.stdin.write(b"save-all flush\n"); self.proc.stdin.flush()
+                if not self.save_done_event.wait(timeout=30):
+                    self._log("BACKUP", "Warning: save confirmation timed out, proceeding anyway")
+            except Exception:
+                pass
+
+        skipped = 0
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for root, dirs, files in os.walk(world_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname   = os.path.relpath(file_path, world_dir)
+                        try:
+                            zf.write(file_path, arcname)
+                        except (PermissionError, OSError):
+                            skipped += 1
+            self.last_backup_time = time.time()
+            msg = f"{fname} created"
+            if skipped:
+                msg += f" ({skipped} locked file(s) skipped)"
+            self._log("BACKUP", msg)
+        except Exception:
+            if os.path.exists(zip_path):
+                try: os.remove(zip_path)
+                except Exception: pass
+            raise
+        finally:
+            if server_running:
+                try:
+                    self.proc.stdin.write(b"save-on\n"); self.proc.stdin.flush()
+                except Exception:
+                    pass
 
     def backup_scheduler(self):
         while True:
