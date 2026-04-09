@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     "backup_dir":       "backups",
     "port":             5000,
     "backups_enabled":  True,
+    "server_name":      "ATMons",
     "users":            [],
 }
 
@@ -73,7 +74,7 @@ def load_config():
         cfg.pop("password", None)
         if is_fresh:
             print("\n" + "="*54)
-            print("  ATMons first run — default login credentials:")
+            print(f"  {cfg.get('server_name') or 'ATMons'} first run — default login credentials:")
             print("    Username : admin")
             print("    Password : changeme")
             print("  Change your password after logging in!")
@@ -216,10 +217,33 @@ def read_output():
                 state["events"].append({"time": ts, "player": e.group("player"), "msg": e.group("msg")})
                 if len(state["events"]) > 200: state["events"].pop(0)
 
+def _resolve_neoforge_args(args):
+    """Replace a hardcoded NeoForge version in java_args with the installed version."""
+    import glob as _glob
+    resolved = []
+    for arg in args:
+        stripped = arg.lstrip("@")
+        if stripped.startswith("libraries/net/neoforged/neoforge/") and stripped.endswith("_args.txt"):
+            filename = os.path.basename(stripped)
+            matches = _glob.glob(os.path.join("libraries", "net", "neoforged", "neoforge", "*", filename))
+            if matches:
+                def _ver_key(p):
+                    try: return tuple(int(x) for x in os.path.basename(os.path.dirname(p)).split("."))
+                    except: return (0,)
+                matches.sort(key=_ver_key)
+                found = "@" + matches[-1].replace("\\", "/")
+                if found != arg:
+                    log_event("CONFIG", f"NeoForge args auto-resolved: {arg} -> {found}")
+                resolved.append(found)
+                continue
+        resolved.append(arg)
+    return resolved
+
 def start():
     global proc
     ready_event.clear()
-    proc = subprocess.Popen(cfg["java_args"], stdin=subprocess.PIPE,
+    launch_args = _resolve_neoforge_args(cfg["java_args"])
+    proc = subprocess.Popen(launch_args, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     threading.Thread(target=read_output, daemon=True).start()
 
@@ -1074,6 +1098,13 @@ fetchMe(); poll(); setInterval(poll,2000); setInterval(pollWatchdogLog,10000);
 </body>
 </html>"""
 
+# ── Apply server_name branding ────────────────────────────────────────────────
+_sn = cfg.get("server_name") or "ATMons"
+LOGIN_HTML     = LOGIN_HTML    .replace("ATMons", _sn)
+DASHBOARD_HTML = DASHBOARD_HTML.replace("ATMons", _sn)
+CONSOLE_HTML   = CONSOLE_HTML  .replace("ATMons", _sn)
+ADMIN_HTML     = ADMIN_HTML    .replace("ATMons", _sn)
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECS = 300
@@ -1532,7 +1563,7 @@ def api_admin_delete_user():
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     os.makedirs(cfg["backup_dir"], exist_ok=True)
-    log_event("WATCHDOG", "ATMons starting up")
+    log_event("WATCHDOG", f"{cfg.get('server_name') or 'ATMons'} starting up")
     threading.Thread(target=monitor,          daemon=True).start()
     threading.Thread(target=backup_scheduler, daemon=True).start()
     try:
