@@ -1098,13 +1098,6 @@ fetchMe(); poll(); setInterval(poll,2000); setInterval(pollWatchdogLog,10000);
 </body>
 </html>"""
 
-# ── Apply server_name branding ────────────────────────────────────────────────
-_sn = cfg.get("server_name") or "ATMons"
-LOGIN_HTML     = LOGIN_HTML    .replace("ATMons", _sn)
-DASHBOARD_HTML = DASHBOARD_HTML.replace("ATMons", _sn)
-CONSOLE_HTML   = CONSOLE_HTML  .replace("ATMons", _sn)
-ADMIN_HTML     = ADMIN_HTML    .replace("ATMons", _sn)
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECS = 300
@@ -1491,6 +1484,13 @@ fetchMe(); loadUsers(); pollStatus();
 </script>
 </body>
 </html>"""
+
+# ── Apply server_name branding ────────────────────────────────────────────────
+_sn = cfg.get("server_name") or "ATMons"
+LOGIN_HTML     = LOGIN_HTML    .replace("ATMons", _sn)
+DASHBOARD_HTML = DASHBOARD_HTML.replace("ATMons", _sn)
+CONSOLE_HTML   = CONSOLE_HTML  .replace("ATMons", _sn)
+ADMIN_HTML     = ADMIN_HTML    .replace("ATMons", _sn)
 
 @app.route("/admin")
 @require_role("admin", "owner")
