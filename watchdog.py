@@ -46,6 +46,7 @@ DEFAULT_SERVER_CFG = {
     "world_dir":        "world",
     "backup_dir":       "backups",
     "backups_enabled":  True,
+    "users":            [],
 }
 
 DEFAULT_CONFIG = {
@@ -59,6 +60,16 @@ def _get_user(username):
     for u in cfg.get("users", []):
         if u.get("username") == username:
             return u
+    return None
+
+def _get_server_role(username, srv):
+    """Returns the user's role on this server, or None if no access."""
+    user = _get_user(username)
+    if user and user.get("role") == "owner":
+        return "owner"
+    for u in srv.scfg.get("users", []):
+        if u.get("username") == username:
+            return u.get("role")
     return None
 
 def load_config():
@@ -495,22 +506,27 @@ async function changePassword(){
 
 _SERVER_BAR_JS = """
 let currentSid=0;
+let _serverRoles={};
 async function loadServerBar(){
   try{
     const list=await fetch('/api/servers').then(r=>r.json());
     const bar=document.getElementById('serverBar');
     if(!bar)return;
-    if(list.length<=1){bar.style.display='none';return;}
-    bar.innerHTML=list.map((s,i)=>
-      '<button class="srv-tab'+(i===currentSid?' active':'')+'" onclick="selectServer('+i+')" id="srvTab'+i+'">'
-      +'<span class="dot '+s.status+'" style="width:7px;height:7px;display:inline-block"></span> '+s.name
-      +'</button>'
-    ).join('');
+    list.forEach(function(s){ _serverRoles[s.id]=s.role; });
+    if(list.length>0) currentSid=list[0].id;
+    if(list.length<=1){bar.style.display='none';}
+    else{
+      bar.innerHTML=list.map(function(s){
+        return '<button class="srv-tab'+(s.id===currentSid?' active':'')+'" onclick="selectServer('+s.id+')" id="srvTab'+s.id+'">'
+          +'<span class="dot '+s.status+'" style="width:7px;height:7px;display:inline-block"></span> '+s.name+'</button>';
+      }).join('');
+    }
+    if(typeof _applyServerRole==='function') _applyServerRole(currentSid);
   }catch(e){}
 }
 function _updateServerTabDots(list){
-  list.forEach(function(s,i){
-    const tab=document.getElementById('srvTab'+i);
+  list.forEach(function(s){
+    const tab=document.getElementById('srvTab'+s.id);
     if(!tab)return;
     const dot=tab.querySelector('.dot');
     if(dot) dot.className='dot '+s.status;
@@ -732,6 +748,12 @@ main{max-width:1200px;margin:0 auto;padding:24px}
 const MAX_RAM=8;
 let charts={}, lastChatLen=0, lastEventLen=0, backupsEnabled=true, lastPollOk=Date.now();
 """ + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
+function _applyServerRole(sid){
+  const role=_serverRoles[sid];
+  const isViewer=(role!=='admin'&&role!=='owner');
+  const as=document.getElementById('actionsSection');
+  if(as) as.style.display=isViewer?'none':'';
+}
 function selectServer(sid){
   currentSid=sid;
   lastChatLen=0; lastEventLen=0;
@@ -741,8 +763,9 @@ function selectServer(sid){
   ['tps','cpu','ram'].forEach(function(k){
     if(charts[k]){charts[k].data.labels=[];charts[k].data.datasets[0].data=[];charts[k].update();}
   });
-  document.querySelectorAll('.srv-tab').forEach(function(t,i){t.classList.toggle('active',i===sid);});
+  document.querySelectorAll('.srv-tab').forEach(function(t){t.classList.toggle('active',t.id==='srvTab'+sid);});
   lastStatus=null;
+  _applyServerRole(sid);
   poll(); pollBackups();
 }
 function mkChart(id,color,yMax,unit){
@@ -939,9 +962,8 @@ async function fetchMe(){
     if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':d.role==='admin'?' \u00b7 admin':'');
     const al=document.getElementById('adminLink');
     if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
+    // Hide console nav entirely for pure viewers (no admin role on any server)
     if(d.role!=='admin'&&d.role!=='owner'){
-      const as=document.getElementById('actionsSection');
-      if(as)as.style.display='none';
       const cl=document.getElementById('conLink');
       if(cl)cl.style.display='none';
     }
@@ -1197,11 +1219,11 @@ ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ATMons &mdash; Users</title>
+<title>ATMons &mdash; Admin</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%2358a6ff'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EA%3C/text%3E%3C/svg%3E">
 <style>
 """ + _HEAD_CSS + """
-main{max-width:800px;margin:0 auto;padding:24px}
+main{max-width:900px;margin:0 auto;padding:24px}
 .section{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:20px}
 .section-title{font-size:.72rem;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
 .user-table{width:100%;border-collapse:collapse;font-size:.85rem}
@@ -1226,20 +1248,23 @@ select.form-input{cursor:pointer}
 .btn-sm:hover{opacity:.8}
 .btn-sm-red{background:#da3633;color:#fff}
 .btn-sm-blue{background:#1f6feb;color:#fff}
+.access-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:16px}
 </style>
 </head>
 <body>
 """ + _HEADER_HTML.replace("{dash_active}", "").replace("{con_active}", "").replace("{adm_active}", " active") + """
 <main>
-  <div class="section">
-    <div class="section-title">Users</div>
+
+  <!-- Global Accounts — owner only, shown via JS -->
+  <div class="section" id="globalSection" style="display:none">
+    <div class="section-title">Global Accounts</div>
     <table class="user-table">
-      <thead><tr><th>Username</th><th>Role</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Username</th><th>Global Role</th><th>Actions</th></tr></thead>
       <tbody id="userList"><tr><td colspan="3" style="color:#484f58">Loading&hellip;</td></tr></tbody>
     </table>
   </div>
-  <div class="section">
-    <div class="section-title">Add User</div>
+  <div class="section" id="addUserSection" style="display:none">
+    <div class="section-title">Add Account</div>
     <div class="form-row">
       <div class="form-group">
         <label class="form-label">Username</label>
@@ -1250,33 +1275,48 @@ select.form-input{cursor:pointer}
         <input id="newPassword" class="form-input" type="password" placeholder="password">
       </div>
       <div class="form-group" style="max-width:130px">
-        <label class="form-label">Role</label>
+        <label class="form-label">Global Role</label>
         <select id="newRole" class="form-input">
           <option value="viewer">Viewer</option>
           <option value="admin">Admin</option>
         </select>
       </div>
-      <button class="btn btn-green" onclick="addUser()">Add User</button>
+      <button class="btn btn-green" onclick="addUser()">Add Account</button>
     </div>
   </div>
+
+  <!-- Server Access — all admins/owners -->
+  <div class="section">
+    <div class="section-title">Server Access</div>
+    <p style="color:#484f58;font-size:.78rem;margin-bottom:14px">Assign which accounts can access each server and what they can do.</p>
+    <div class="access-tabs" id="srvAccessTabs"></div>
+    <div id="srvAccessContent"><p style="color:#484f58;font-size:.85rem">Loading&hellip;</p></div>
+  </div>
+
 </main>
 <div class="toasts" id="toasts"></div>
 <script>
 """ + _TOAST_JS + _SERVER_BAR_JS + """
+function selectServer(sid){ window.location='/'; }
+let _me='', _myRole='', _users=[];
 async function fetchMe(){
   try{
     const d=await fetch('/api/me').then(r=>r.json());
+    _me=d.username; _myRole=d.role;
     const ub=document.getElementById('userBadge');
-    if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':' \u00b7 admin');
+    if(ub) ub.textContent=_me+(_myRole==='owner'?' \u00b7 owner':' \u00b7 admin');
     const al=document.getElementById('adminLink');
     if(al) al.style.display='';
+    if(_myRole==='owner'){
+      document.getElementById('globalSection').style.display='';
+      document.getElementById('addUserSection').style.display='';
+      loadUsers();
+    }
+    initServerAccess();
   }catch(e){}
 }
-let _users=[], _me='', _myRole='';
 async function loadUsers(){
   try{
-    const me=await fetch('/api/me').then(r=>r.json());
-    _me=me.username; _myRole=me.role;
     _users=await fetch('/api/admin/users').then(r=>r.json());
     const tbody=document.getElementById('userList');
     if(!_users.length){tbody.innerHTML='<tr><td colspan="3" style="color:#484f58">No users.</td></tr>';return;}
@@ -1288,16 +1328,14 @@ async function loadUsers(){
       if(isSelf){
         actions='<span style="color:#484f58;font-size:.75rem">current user</span>';
       }else if(canAct){
-        actions+='<button class="btn-sm btn-sm-blue" onclick="resetPassword('+i+')">Reset PW</button>';
-        if(!isOwner) actions+='<button class="btn-sm" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9" onclick="toggleRole('+i+')">'+(u.role==='admin'?'Make Viewer':'Make Admin')+'</button>';
+        actions+='<button class="btn-sm btn-sm-blue" onclick="resetPassword('+i+')">Reset PW</button> ';
+        if(!isOwner) actions+='<button class="btn-sm" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9" onclick="toggleRole('+i+')">'+(u.role==='admin'?'Make Viewer':'Make Admin')+'</button> ';
         actions+='<button class="btn-sm btn-sm-red" onclick="deleteUser('+i+')">Delete</button>';
       }else{
         actions='<span style="color:#484f58;font-size:.75rem">protected</span>';
       }
-      return '<tr>'
-        +'<td>'+u.username+'</td>'
-        +'<td><span class="role-badge '+u.role+'">'+u.role+'</span></td>'
-        +'<td style="display:flex;gap:8px;align-items:center">'+actions+'</td></tr>';
+      return '<tr><td>'+u.username+'</td><td><span class="role-badge '+u.role+'">'+u.role+'</span></td>'
+        +'<td style="display:flex;gap:6px;align-items:center">'+actions+'</td></tr>';
     }).join('');
   }catch(e){toast('Failed to load users','err');}
 }
@@ -1309,17 +1347,17 @@ async function addUser(){
   try{
     const r=await fetch('/api/admin/users/add',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username,password,role})}).then(r=>r.json());
-    if(r.ok){toast('User added','ok');document.getElementById('newUsername').value='';document.getElementById('newPassword').value='';loadUsers();}
+    if(r.ok){toast('Account added','ok');document.getElementById('newUsername').value='';document.getElementById('newPassword').value='';loadUsers();}
     else toast('Error: '+r.error,'err');
   }catch(e){toast('Failed','err');}
 }
 async function deleteUser(i){
   const u=_users[i];
-  if(!confirm('Delete user '+u.username+'?'))return;
+  if(!confirm('Delete account '+u.username+'?'))return;
   try{
     const r=await fetch('/api/admin/users/delete',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:u.username})}).then(r=>r.json());
-    if(r.ok){toast('User deleted','ok');loadUsers();}
+    if(r.ok){toast('Account deleted','ok');loadUsers();}
     else toast('Error: '+r.error,'err');
   }catch(e){toast('Failed','err');}
 }
@@ -1345,7 +1383,121 @@ async function toggleRole(i){
     else toast('Error: '+r.error,'err');
   }catch(e){toast('Failed','err');}
 }
-fetchMe(); loadServerBar(); loadUsers();
+
+// ── Server Access ──────────────────────────────────────────────────────────────
+let _accessServers=[], _currentAccessSid=null, _srvAccessUsers=[];
+async function initServerAccess(){
+  try{
+    const list=await fetch('/api/servers').then(r=>r.json());
+    _accessServers=list.filter(function(s){return s.role==='admin'||s.role==='owner';});
+    const tabs=document.getElementById('srvAccessTabs');
+    if(!_accessServers.length){
+      tabs.innerHTML='';
+      document.getElementById('srvAccessContent').innerHTML='<p style="color:#484f58;font-size:.85rem">No servers accessible.</p>';
+      return;
+    }
+    tabs.innerHTML=_accessServers.map(function(s,i){
+      return '<button class="srv-tab'+(i===0?' active':'')+'" onclick="loadServerAccess('+s.id+')" id="srvAccessTab'+s.id+'">'+s.name+'</button>';
+    }).join('');
+    loadServerAccess(_accessServers[0].id);
+  }catch(e){}
+}
+async function loadServerAccess(sid){
+  _currentAccessSid=sid;
+  document.querySelectorAll('#srvAccessTabs .srv-tab').forEach(function(t){
+    t.classList.toggle('active',t.id==='srvAccessTab'+sid);
+  });
+  const content=document.getElementById('srvAccessContent');
+  content.innerHTML='<p style="color:#484f58;font-size:.85rem">Loading\u2026</p>';
+  try{
+    _srvAccessUsers=await fetch('/api/admin/servers/'+sid+'/users').then(r=>r.json());
+    renderServerAccess(sid);
+  }catch(e){content.innerHTML='<p style="color:#f85149;font-size:.85rem">Failed to load.</p>';}
+}
+function renderServerAccess(sid){
+  const srv=_accessServers.find(function(s){return s.id===sid;});
+  const callerRole=srv?srv.role:null;
+  const content=document.getElementById('srvAccessContent');
+  const assigned=_srvAccessUsers.filter(function(u){return u.server_role!==null;});
+  const unassigned=_srvAccessUsers.filter(function(u){return u.server_role===null;});
+  let html='';
+  const editableAssigned=assigned.filter(function(u){return !u.is_owner;});
+  if(assigned.length){
+    html+='<table class="user-table"><thead><tr><th>Username</th><th>Role on this server</th><th>Actions</th></tr></thead><tbody>';
+    assigned.forEach(function(u){
+      if(u.is_owner){
+        html+='<tr><td>'+u.username+'</td><td><span class="role-badge owner">owner</span></td>'
+          +'<td><span style="color:#484f58;font-size:.75rem">full access</span></td></tr>';
+      }else{
+        const idx=editableAssigned.indexOf(u);
+        let actions='';
+        if(callerRole==='owner'){
+          const opp=u.server_role==='admin'?'viewer':'admin';
+          const oppCap=opp.charAt(0).toUpperCase()+opp.slice(1);
+          actions+='<button class="btn-sm btn-sm-blue" onclick="changeServerRole('+sid+','+idx+')">Make '+oppCap+'</button> ';
+        }
+        actions+='<button class="btn-sm btn-sm-red" onclick="removeServerUser('+sid+','+idx+')">Remove</button>';
+        html+='<tr><td>'+u.username+'</td><td><span class="role-badge '+u.server_role+'">'+u.server_role+'</span></td>'
+          +'<td style="display:flex;gap:6px;align-items:center">'+actions+'</td></tr>';
+      }
+    });
+    html+='</tbody></table>';
+  }else{
+    html+='<p style="color:#484f58;font-size:.82rem;margin-bottom:12px">No users assigned to this server yet.</p>';
+  }
+  if(unassigned.length){
+    html+='<div style="margin-top:16px"><div class="section-title" style="margin-bottom:10px">Grant Access</div>'
+      +'<div class="form-row">'
+      +'<div class="form-group"><label class="form-label">Account</label>'
+      +'<select id="assignUser" class="form-input">'
+      +unassigned.map(function(u){return '<option value="'+u.username+'">'+u.username+'</option>';}).join('')
+      +'</select></div>'
+      +'<div class="form-group" style="max-width:130px"><label class="form-label">Role</label>'
+      +'<select id="assignRole" class="form-input"><option value="viewer">Viewer</option>'
+      +(callerRole==='owner'?'<option value="admin">Admin</option>':'')
+      +'</select></div>'
+      +'<button class="btn btn-green" onclick="assignServerUser('+sid+')">Grant Access</button>'
+      +'</div></div>';
+  }
+  content.innerHTML=html||'<p style="color:#484f58;font-size:.85rem">All accounts have been assigned.</p>';
+}
+async function assignServerUser(sid){
+  const username=document.getElementById('assignUser').value;
+  const role=document.getElementById('assignRole').value;
+  try{
+    const r=await fetch('/api/admin/servers/'+sid+'/users/assign',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({username,role})}).then(r=>r.json());
+    if(r.ok){toast('Access granted','ok');loadServerAccess(sid);}
+    else toast('Error: '+r.error,'err');
+  }catch(e){toast('Failed','err');}
+}
+async function changeServerRole(sid,idx){
+  const list=_srvAccessUsers.filter(function(u){return u.server_role!==null&&!u.is_owner;});
+  const u=list[idx];
+  if(!u)return;
+  const role=u.server_role==='admin'?'viewer':'admin';
+  try{
+    const r=await fetch('/api/admin/servers/'+sid+'/users/assign',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.username,role})}).then(r=>r.json());
+    if(r.ok){toast('Role updated','ok');loadServerAccess(sid);}
+    else toast('Error: '+r.error,'err');
+  }catch(e){toast('Failed','err');}
+}
+async function removeServerUser(sid,idx){
+  const list=_srvAccessUsers.filter(function(u){return u.server_role!==null&&!u.is_owner;});
+  const u=list[idx];
+  if(!u)return;
+  if(!confirm('Remove '+u.username+' from this server?'))return;
+  try{
+    const r=await fetch('/api/admin/servers/'+sid+'/users/assign',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.username,role:null})}).then(r=>r.json());
+    if(r.ok){toast('Access removed','ok');loadServerAccess(sid);}
+    else toast('Error: '+r.error,'err');
+  }catch(e){toast('Failed','err');}
+}
+fetchMe(); loadServerBar();
+const _sp=document.querySelector('.status-pill');
+if(_sp)_sp.style.display='none';
 </script>
 </body>
 </html>"""
@@ -1379,7 +1531,17 @@ def login():
             session.permanent = True
             session["authenticated"] = True
             session["username"] = user["username"]
-            session["role"]     = user["role"]
+            # Compute max role: owner beats all; otherwise check per-server assignments
+            if user.get("role") == "owner":
+                role = "owner"
+            else:
+                role = "viewer"
+                for scfg in cfg.get("servers", []):
+                    for su in scfg.get("users", []):
+                        if su.get("username") == username and su.get("role") == "admin":
+                            role = "admin"
+                            break
+            session["role"] = role
             return redirect("/")
         count += 1
         locked_until = now + _LOCKOUT_SECS if count >= _MAX_ATTEMPTS else 0.0
@@ -1419,13 +1581,21 @@ def _sanitize(v):
 @app.route("/api/servers")
 @require_auth
 def api_servers():
-    return jsonify([{"id": i, "name": s.name, "status": s.state["status"]} for i, s in enumerate(servers)])
+    username = session.get("username")
+    result = []
+    for i, srv in enumerate(servers):
+        role = _get_server_role(username, srv)
+        if role:
+            result.append({"id": i, "name": srv.name, "status": srv.state["status"], "role": role})
+    return jsonify(result)
 
 @app.route("/api/<int:sid>")
 @require_auth
 def api(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if not _get_server_role(session.get("username"), srv):
+        return jsonify({"error": "forbidden"}), 403
     try:
         with srv.state_lock:
             data = {k: _sanitize(list(v) if isinstance(v, list) else v)
@@ -1447,6 +1617,8 @@ def api(sid):
 def api_log(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if not _get_server_role(session.get("username"), srv):
+        return jsonify({"error": "forbidden"}), 403
     with srv.state_lock:
         return jsonify({"log": list(srv.state["log"]), "status": srv.state["status"]})
 
@@ -1467,6 +1639,8 @@ def api_watchdog_log():
 def list_backups(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if not _get_server_role(session.get("username"), srv):
+        return jsonify({"error": "forbidden"}), 403
     backup_dir = os.path.join(srv.server_dir, srv.scfg["backup_dir"])
     if not os.path.exists(backup_dir):
         return jsonify([])
@@ -1486,6 +1660,8 @@ def list_backups(sid):
 def download_backup(sid, filename):
     srv, err = _get_server(sid)
     if err: return err
+    if not _get_server_role(session.get("username"), srv):
+        return "Forbidden", 403
     if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
         return "Invalid filename", 400
     path = os.path.join(srv.server_dir, srv.scfg["backup_dir"], filename)
@@ -1494,10 +1670,12 @@ def download_backup(sid, filename):
     return send_file(os.path.abspath(path), as_attachment=True)
 
 @app.route("/backup/<int:sid>/delete/<filename>", methods=["POST"])
-@require_role("admin", "owner")
+@require_auth
 def delete_backup(sid, filename):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
     if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
         return jsonify({"ok": False, "error": "Invalid filename"}), 400
     path = os.path.join(srv.server_dir, srv.scfg["backup_dir"], filename)
@@ -1511,10 +1689,12 @@ def delete_backup(sid, filename):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/server/<int:sid>/command", methods=["POST"])
-@require_role("admin", "owner")
+@require_auth
 def command(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
     now = time.time()
     if now - srv._last_cmd_time < 0.5:
         return jsonify({"ok": False, "error": "Too fast, slow down"}), 429
@@ -1530,44 +1710,54 @@ def command(sid):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/server/<int:sid>/stop")
-@require_role("admin", "owner")
+@require_auth
 def stop_server(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
     threading.Thread(target=srv.stop, daemon=True).start()
     return "stopping"
 
 @app.route("/server/<int:sid>/restart")
-@require_role("admin", "owner")
+@require_auth
 def restart(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
     threading.Thread(target=srv.stop, daemon=True).start()
     return "restarting"
 
 @app.route("/server/<int:sid>/backup")
-@require_role("admin", "owner")
+@require_auth
 def do_backup(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
     threading.Thread(target=srv.backup, daemon=True).start()
     return "backup started"
 
 @app.route("/server/<int:sid>/toggle_backups")
-@require_role("admin", "owner")
+@require_auth
 def toggle_backups(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
     srv.state["backups_enabled"] = not srv.state["backups_enabled"]
     srv.scfg["backups_enabled"]  = srv.state["backups_enabled"]
     save_config(cfg)
     return jsonify({"enabled": srv.state["backups_enabled"]})
 
 @app.route("/server/<int:sid>/start")
-@require_role("admin", "owner")
+@require_auth
 def start_server(sid):
     srv, err = _get_server(sid)
     if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
     if srv.state["status"] in ("online", "starting"):
         return "already running"
     with srv.state_lock:
@@ -1645,6 +1835,51 @@ def api_admin_update_user():
         user["role"] = data["role"]
     save_config(cfg)
     log_event("ADMIN", f"User '{username}' updated by {session.get('username')}")
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/servers/<int:sid>/users")
+@require_role("admin", "owner")
+def api_admin_server_users(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
+    srv_user_map = {u["username"]: u["role"] for u in srv.scfg.get("users", [])}
+    result = []
+    for u in cfg.get("users", []):
+        if u["role"] == "owner":
+            result.append({"username": u["username"], "server_role": "owner", "is_owner": True})
+        else:
+            sr = srv_user_map.get(u["username"])
+            result.append({"username": u["username"], "server_role": sr, "is_owner": False})
+    return jsonify(result)
+
+@app.route("/api/admin/servers/<int:sid>/users/assign", methods=["POST"])
+@require_role("admin", "owner")
+def api_admin_server_users_assign(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    caller_role = _get_server_role(session.get("username"), srv)
+    if caller_role not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
+    data     = request.json or {}
+    username = data.get("username", "").strip()
+    role     = data.get("role")   # "admin", "viewer", or None to remove
+    target   = _get_user(username)
+    if not target:
+        return jsonify({"ok": False, "error": "User not found"}), 404
+    if target["role"] == "owner":
+        return jsonify({"ok": False, "error": "Cannot assign server role to owner"}), 400
+    if role == "admin" and caller_role != "owner":
+        return jsonify({"ok": False, "error": "Only the owner can grant admin access"}), 403
+    if role not in ("admin", "viewer", None):
+        return jsonify({"ok": False, "error": "Invalid role"}), 400
+    srv.scfg["users"] = [u for u in srv.scfg.get("users", []) if u["username"] != username]
+    if role in ("admin", "viewer"):
+        srv.scfg["users"].append({"username": username, "role": role})
+    save_config(cfg)
+    action = f"set to {role}" if role else "removed"
+    log_event("ADMIN", f"Server '{srv.name}': '{username}' server role {action} by {session.get('username')}")
     return jsonify({"ok": True})
 
 @app.route("/api/admin/users/delete", methods=["POST"])
