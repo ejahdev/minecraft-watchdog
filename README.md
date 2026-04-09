@@ -44,7 +44,7 @@ All settings live in `watchdog_config.json`. Edit and restart the watchdog to ap
 | `world_dir` | `world` | Folder to back up |
 | `backup_dir` | `backups` | Folder where backups are saved |
 | `port` | `5000` | Dashboard web port |
-| `server_name` | `ATMons` | Name shown in the dashboard header and page titles |
+| `server_name` | `Minecraft Watchdog` | Name shown in the dashboard header and page titles |
 | `backups_enabled` | `true` | Whether auto-backups are enabled on start |
 
 > **Note:** The default `java_args` references NeoForge version `21.1.224`. Update this to match your actual NeoForge installation.

@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     "backup_dir":       "backups",
     "port":             5000,
     "backups_enabled":  True,
-    "server_name":      "ATMons",
+    "server_name":      "Minecraft Watchdog",
     "users":            [],
 }
 
