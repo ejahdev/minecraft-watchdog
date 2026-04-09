@@ -4,7 +4,7 @@ from mcstatus import JavaServer
 import psutil
 from flask import Flask, jsonify, render_template_string, request, session, redirect, send_file
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 CONFIG_FILE  = "watchdog_config.json"
 WATCHDOG_LOG = "watchdog.log"
 
@@ -15,6 +15,7 @@ def log_event(kind, msg):
             f.write(f"[{ts}] [{kind}] {msg}\n")
     except Exception: pass
 
+# ── Password helpers ───────────────────────────────────────────────────────────
 def _hash_password(pw):
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 600_000).hex()
@@ -30,7 +31,10 @@ def _check_password(pw, stored):
     except Exception:
         return False
 
-DEFAULT_CONFIG = {
+# ── Config ─────────────────────────────────────────────────────────────────────
+DEFAULT_SERVER_CFG = {
+    "name":             "My Server",
+    "server_dir":       ".",
     "java_args":        ["java","@user_jvm_args.txt","@libraries/net/neoforged/neoforge/21.1.224/win_args.txt","nogui"],
     "server_ip":        "127.0.0.1",
     "server_port":      25565,
@@ -41,10 +45,14 @@ DEFAULT_CONFIG = {
     "crash_window":     300,
     "world_dir":        "world",
     "backup_dir":       "backups",
-    "port":             5000,
     "backups_enabled":  True,
-    "server_name":      "Minecraft Watchdog",
-    "users":            [],
+}
+
+DEFAULT_CONFIG = {
+    "port":        5000,
+    "server_name": "Minecraft Watchdog",
+    "users":       [],
+    "servers":     [],
 }
 
 def _get_user(username):
@@ -54,27 +62,37 @@ def _get_user(username):
     return None
 
 def load_config():
-    cfg = DEFAULT_CONFIG.copy()
+    c = {**DEFAULT_CONFIG}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
-                cfg.update(json.load(f))
+                c.update(json.load(f))
         except Exception as e:
             log_event("ERROR", f"Config read failed ({e}); using defaults")
-    if not cfg.get("secret_key"):
-        cfg["secret_key"] = secrets.token_hex(32)
+    if not c.get("secret_key"):
+        c["secret_key"] = secrets.token_hex(32)
+    # Migrate old flat single-server config to servers list
+    if not c.get("servers"):
+        scfg = {k: c.pop(k, DEFAULT_SERVER_CFG[k]) for k in DEFAULT_SERVER_CFG}
+        scfg["name"] = "My Server"
+        scfg.setdefault("server_dir", ".")
+        c["servers"] = [scfg]
+        log_event("CONFIG", "Migrated to multi-server config format")
+    # Ensure every server entry has all required keys
+    for s in c["servers"]:
+        for k, v in DEFAULT_SERVER_CFG.items():
+            s.setdefault(k, v)
     # Migrate old single-password field to users list
-    if not cfg.get("users"):
-        old_pw    = cfg.get("password", "changeme")
-        is_fresh  = old_pw == "changeme"
-        plain_pw  = old_pw if not str(old_pw).startswith("pbkdf2:") else None
-        if plain_pw:
+    if not c.get("users"):
+        old_pw   = c.get("password", "changeme")
+        is_fresh = old_pw == "changeme"
+        if not str(old_pw).startswith("pbkdf2:"):
             old_pw = _hash_password(old_pw)
-        cfg["users"] = [{"username": "admin", "password": old_pw, "role": "owner"}]
-        cfg.pop("password", None)
+        c["users"] = [{"username": "admin", "password": old_pw, "role": "owner"}]
+        c.pop("password", None)
         if is_fresh:
             print("\n" + "="*54)
-            print(f"  {cfg.get('server_name') or 'ATMons'} first run — default login credentials:")
+            print(f"  {c.get('server_name') or 'Minecraft Watchdog'} first run — default login credentials:")
             print("    Username : admin")
             print("    Password : changeme")
             print("  Change your password after logging in!")
@@ -82,17 +100,15 @@ def load_config():
             log_event("SETUP", "Default credentials: admin / changeme — change immediately")
         else:
             log_event("SECURITY", "Migrated to multi-user config. Login: admin / previous password")
-    # Migrate: if no owner exists yet, promote the first user to owner
-    if cfg.get("users") and not any(u.get("role") == "owner" for u in cfg["users"]):
-        cfg["users"][0]["role"] = "owner"
-        log_event("SECURITY", f"Promoted '{cfg['users'][0]['username']}' to owner (migration)")
-    # Hash any plaintext passwords in users list
-    for u in cfg.get("users", []):
+    if c.get("users") and not any(u.get("role") == "owner" for u in c["users"]):
+        c["users"][0]["role"] = "owner"
+        log_event("SECURITY", f"Promoted '{c['users'][0]['username']}' to owner (migration)")
+    for u in c.get("users", []):
         if u.get("password") and not str(u["password"]).startswith("pbkdf2:"):
             u["password"] = _hash_password(u["password"])
             log_event("SECURITY", f"Hashed password for user '{u['username']}'")
-    save_config(cfg)
-    return cfg
+    save_config(c)
+    return c
 
 def save_config(c):
     tmp = CONFIG_FILE + ".tmp"
@@ -107,45 +123,12 @@ def save_config(c):
 
 cfg = load_config()
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# ── App setup ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = cfg["secret_key"]
 app.config["PERMANENT_SESSION_LIFETIME"] = datetime.timedelta(hours=12)
-mc_server = JavaServer.lookup(f"{cfg['server_ip']}:{cfg['server_port']}")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-state = {
-    "status":       "offline",
-    "players":      0,
-    "max_players":  20,
-    "player_list":  [],
-    "cpu":          0,
-    "ram":          0,
-    "latency":      0,
-    "tps":          20,
-    "history":      [],
-    "cpu_history":  [],
-    "ram_history":  [],
-    "uptime":       0,
-    "chat":         [],
-    "events":       [],
-    "log":          [],
-    "backups_enabled": cfg["backups_enabled"],
-    "crash_count":  0,
-    "motd":         "",
-    "version":      "",
-}
-state_lock       = threading.Lock()
-proc             = None
-start_time       = None
-ready_event      = threading.Event()
-restart_event    = threading.Event()
-crash_times      = []
-last_backup_time = None
-_last_cmd_time   = 0.0
-_login_attempts  = {}   # ip -> [count, lockout_until]
-
-# ── Regex ─────────────────────────────────────────────────────────────────────
+# ── Regex ──────────────────────────────────────────────────────────────────────
 CHAT_RE  = re.compile(r'\[.+?/INFO\].*?:\s<(.+?)>\s(.+)')
 DONE_RE  = re.compile(r'Done \(')
 ANSI_RE  = re.compile(r'\x1b\[[0-9;]*m')
@@ -162,9 +145,8 @@ EVENT_RE = re.compile(
     r'|lost connection.+))'
 )
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ───────────────────────────────────────────────────────────────────────
 def _auth_check():
-    """Returns (401/403 response, None) or (None, None) if ok."""
     if not session.get("authenticated"):
         if request.path.startswith("/api") or request.is_json:
             return jsonify({"error": "unauthorized"}), 401
@@ -195,164 +177,227 @@ def require_role(*roles):
         return decorated
     return decorator
 
-# ── Server control ────────────────────────────────────────────────────────────
-def read_output():
-    for raw in proc.stdout:
-        try: line = ANSI_RE.sub("", raw.decode("utf-8", "replace").rstrip())
-        except Exception: continue
-        if DONE_RE.search(line):
-            ready_event.set()
-        with state_lock:
-            state["log"].append(line)
-            if len(state["log"]) > 500: state["log"].pop(0)
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        m = CHAT_RE.search(line)
-        if m:
-            with state_lock:
-                state["chat"].append({"time": ts, "player": m.group(1), "msg": m.group(2)})
-                if len(state["chat"]) > 100: state["chat"].pop(0)
-        e = EVENT_RE.search(line)
-        if e:
-            with state_lock:
-                state["events"].append({"time": ts, "player": e.group("player"), "msg": e.group("msg")})
-                if len(state["events"]) > 200: state["events"].pop(0)
+# ── ServerInstance ─────────────────────────────────────────────────────────────
+class ServerInstance:
+    def __init__(self, idx, scfg):
+        self.idx         = idx
+        self.scfg        = scfg
+        self.name        = scfg.get("name", f"Server {idx}")
+        self.server_dir  = os.path.abspath(scfg.get("server_dir", "."))
+        self.state = {
+            "status":        "offline",
+            "players":       0,
+            "max_players":   20,
+            "player_list":   [],
+            "cpu":           0,
+            "ram":           0,
+            "latency":       0,
+            "tps":           20,
+            "history":       [],
+            "cpu_history":   [],
+            "ram_history":   [],
+            "uptime":        0,
+            "chat":          [],
+            "events":        [],
+            "log":           [],
+            "backups_enabled": scfg.get("backups_enabled", True),
+            "crash_count":   0,
+            "motd":          "",
+            "version":       "",
+        }
+        self.state_lock       = threading.Lock()
+        self.proc             = None
+        self.start_time       = None
+        self.ready_event      = threading.Event()
+        self.restart_event    = threading.Event()
+        self.crash_times      = []
+        self.last_backup_time = None
+        self._last_cmd_time   = 0.0
+        self._mc_server       = None
 
-def _resolve_neoforge_args(args):
-    """Replace a hardcoded NeoForge version in java_args with the installed version."""
-    import glob as _glob
-    resolved = []
-    for arg in args:
-        stripped = arg.lstrip("@")
-        if stripped.startswith("libraries/net/neoforged/neoforge/") and stripped.endswith("_args.txt"):
-            filename = os.path.basename(stripped)
-            matches = _glob.glob(os.path.join("libraries", "net", "neoforged", "neoforge", "*", filename))
-            if matches:
-                def _ver_key(p):
-                    try: return tuple(int(x) for x in os.path.basename(os.path.dirname(p)).split("."))
-                    except: return (0,)
-                matches.sort(key=_ver_key)
-                found = "@" + matches[-1].replace("\\", "/")
-                if found != arg:
-                    log_event("CONFIG", f"NeoForge args auto-resolved: {arg} -> {found}")
-                resolved.append(found)
+    @property
+    def mc_server(self):
+        if self._mc_server is None:
+            self._mc_server = JavaServer.lookup(f"{self.scfg['server_ip']}:{self.scfg['server_port']}")
+        return self._mc_server
+
+    def _log(self, kind, msg):
+        log_event(kind, f"[{self.name}] {msg}")
+
+    def _resolve_neoforge_args(self, args):
+        import glob as _glob
+        resolved = []
+        for arg in args:
+            stripped = arg.lstrip("@")
+            if stripped.startswith("libraries/net/neoforged/neoforge/") and stripped.endswith("_args.txt"):
+                filename = os.path.basename(stripped)
+                pattern  = os.path.join(self.server_dir, "libraries", "net", "neoforged", "neoforge", "*", filename)
+                matches  = _glob.glob(pattern)
+                if matches:
+                    def _ver_key(p):
+                        try: return tuple(int(x) for x in os.path.basename(os.path.dirname(p)).split("."))
+                        except: return (0,)
+                    matches.sort(key=_ver_key)
+                    rel   = os.path.relpath(matches[-1], self.server_dir).replace("\\", "/")
+                    found = "@" + rel
+                    if found != arg:
+                        self._log("CONFIG", f"NeoForge args auto-resolved: {arg} -> {found}")
+                    resolved.append(found)
+                    continue
+            resolved.append(arg)
+        return resolved
+
+    def read_output(self):
+        for raw in self.proc.stdout:
+            try: line = ANSI_RE.sub("", raw.decode("utf-8", "replace").rstrip())
+            except Exception: continue
+            if DONE_RE.search(line):
+                self.ready_event.set()
+            with self.state_lock:
+                self.state["log"].append(line)
+                if len(self.state["log"]) > 500: self.state["log"].pop(0)
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            m  = CHAT_RE.search(line)
+            if m:
+                with self.state_lock:
+                    self.state["chat"].append({"time": ts, "player": m.group(1), "msg": m.group(2)})
+                    if len(self.state["chat"]) > 100: self.state["chat"].pop(0)
+            e = EVENT_RE.search(line)
+            if e:
+                with self.state_lock:
+                    self.state["events"].append({"time": ts, "player": e.group("player"), "msg": e.group("msg")})
+                    if len(self.state["events"]) > 200: self.state["events"].pop(0)
+
+    def start(self):
+        self.ready_event.clear()
+        launch_args = self._resolve_neoforge_args(self.scfg["java_args"])
+        self.proc = subprocess.Popen(
+            launch_args, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=self.server_dir
+        )
+        threading.Thread(target=self.read_output, daemon=True).start()
+
+    def stop(self):
+        self._log("STOP", "Stop requested")
+        try:
+            self.proc.stdin.write(b"stop\n"); self.proc.stdin.flush()
+            self.proc.wait(timeout=30)
+        except Exception:
+            self.proc.kill()
+
+    def backup(self):
+        backup_dir = os.path.join(self.server_dir, self.scfg["backup_dir"])
+        world_dir  = os.path.join(self.server_dir, self.scfg["world_dir"])
+        os.makedirs(backup_dir, exist_ok=True)
+        ts    = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        fname = f"world_{ts}"
+        shutil.make_archive(os.path.join(backup_dir, fname), "zip", world_dir)
+        self.last_backup_time = time.time()
+        self._log("BACKUP", f"{fname}.zip created")
+
+    def backup_scheduler(self):
+        while True:
+            time.sleep(self.scfg["backup_interval"])
+            if self.state["backups_enabled"] and self.state["status"] == "online":
+                self.backup()
+
+    def monitor(self):
+        self._log("WATCHDOG", "Watchdog started")
+        while True:
+            now = time.time()
+            with self.state_lock:
+                self.crash_times[:] = [t for t in self.crash_times if now - t < self.scfg["crash_window"]]
+                self.state["crash_count"] = len(self.crash_times)
+
+            if len(self.crash_times) >= self.scfg["max_crashes"]:
+                self.state["status"] = "crashed"
+                self._log("CRASH_LOOP", f"Max crashes reached, pausing {self.scfg['crash_window']}s")
+                self.restart_event.wait(timeout=self.scfg["crash_window"])
+                self.restart_event.clear()
+                with self.state_lock:
+                    self.crash_times.clear()
+                    self.state["crash_count"] = 0
                 continue
-        resolved.append(arg)
-    return resolved
 
-def start():
-    global proc
-    ready_event.clear()
-    launch_args = _resolve_neoforge_args(cfg["java_args"])
-    proc = subprocess.Popen(launch_args, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    threading.Thread(target=read_output, daemon=True).start()
+            self.state["status"] = "starting"
+            self._log("START", "Starting server process")
+            self.start()
+            self.start_time = time.time()
 
-def stop():
-    log_event("STOP", "Stop requested")
+            if not self.ready_event.wait(timeout=self.scfg["max_startup_wait"]):
+                self.proc.kill()
+                self.state["status"] = "offline"
+                self._log("CRASH", "Server did not start within timeout")
+                with self.state_lock: self.crash_times.append(time.time())
+                self.restart_event.wait(timeout=5)
+                self.restart_event.clear()
+                continue
+
+            self._log("ONLINE", "Server is online")
+            failures = 0
+            psproc   = psutil.Process(self.proc.pid)
+            psproc.cpu_percent()
+
+            while self.proc.poll() is None:
+                time.sleep(self.scfg["check_interval"])
+                self.state["uptime"] = int(time.time() - self.start_time) if self.start_time else 0
+                try:
+                    s = self.mc_server.status()
+                    self.state["status"]      = "online"
+                    self.state["players"]     = s.players.online
+                    self.state["max_players"] = s.players.max
+                    self.state["player_list"] = [p.name for p in s.players.sample] if s.players.sample else []
+                    self.state["latency"]     = round(s.latency, 1)
+                    self.state["version"]     = s.version.name if s.version else ""
+                    self.state["motd"]        = MOTD_RE.sub("", str(s.description)).strip()
+                    tps = max(0, min(20, 20 - (s.latency / 50)))
+                    self.state["tps"] = round(tps, 2)
+                    with self.state_lock:
+                        self.state["history"].append(self.state["tps"])
+                        if len(self.state["history"]) > 50: self.state["history"].pop(0)
+                    failures = 0
+                except Exception:
+                    failures += 1
+                    if failures >= 3: self.state["status"] = "offline"
+                    if failures >= 5:
+                        self._log("CRASH", "Server stopped responding")
+                        self.proc.kill(); break
+
+                try:
+                    cpu = round(psproc.cpu_percent(), 1)
+                    ram = round(psproc.memory_info().rss / (1024 ** 3), 2)
+                    self.state["cpu"] = cpu
+                    self.state["ram"] = ram
+                    with self.state_lock:
+                        self.state["cpu_history"].append(cpu)
+                        if len(self.state["cpu_history"]) > 50: self.state["cpu_history"].pop(0)
+                        self.state["ram_history"].append(ram)
+                        if len(self.state["ram_history"]) > 50: self.state["ram_history"].pop(0)
+                except Exception: pass
+
+            self.state["status"]      = "offline"
+            self.state["player_list"] = []
+            self._log("OFFLINE", "Server process ended")
+            with self.state_lock: self.crash_times.append(time.time())
+            self.restart_event.wait(timeout=5)
+            self.restart_event.clear()
+
+# ── Server registry ────────────────────────────────────────────────────────────
+servers = []  # populated in __main__
+
+def _get_server(sid):
     try:
-        proc.stdin.write(b"stop\n"); proc.stdin.flush()
-        proc.wait(timeout=30)
-    except Exception:
-        proc.kill()
+        idx = int(sid)
+        if 0 <= idx < len(servers):
+            return servers[idx], None
+    except (ValueError, TypeError):
+        pass
+    return None, (jsonify({"error": "Server not found"}), 404)
 
-def backup():
-    global last_backup_time
-    os.makedirs(cfg["backup_dir"], exist_ok=True)
-    ts    = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fname = f"world_{ts}"
-    shutil.make_archive(os.path.join(cfg["backup_dir"], fname), "zip", cfg["world_dir"])
-    last_backup_time = time.time()
-    log_event("BACKUP", f"{fname}.zip created")
+_login_attempts = {}  # ip -> [count, lockout_until]
 
-def backup_scheduler():
-    while True:
-        time.sleep(cfg["backup_interval"])
-        if state["backups_enabled"] and state["status"] == "online":
-            backup()
-
-def monitor():
-    global proc, start_time
-    log_event("WATCHDOG", "Watchdog started")
-    while True:
-        now = time.time()
-        with state_lock:
-            crash_times[:] = [t for t in crash_times if now - t < cfg["crash_window"]]
-            state["crash_count"] = len(crash_times)
-
-        if len(crash_times) >= cfg["max_crashes"]:
-            state["status"] = "crashed"
-            log_event("CRASH_LOOP", f"Max crashes reached, pausing {cfg['crash_window']}s")
-            restart_event.wait(timeout=cfg["crash_window"])
-            restart_event.clear()
-            with state_lock:
-                crash_times.clear()
-                state["crash_count"] = 0
-            continue
-
-        state["status"] = "starting"
-        log_event("START", "Starting server process")
-        start()
-        start_time = time.time()
-
-        if not ready_event.wait(timeout=cfg["max_startup_wait"]):
-            proc.kill()
-            state["status"] = "offline"
-            log_event("CRASH", "Server did not start within timeout")
-            with state_lock: crash_times.append(time.time())
-            restart_event.wait(timeout=5)
-            restart_event.clear()
-            continue
-
-        log_event("ONLINE", "Server is online")
-        failures = 0
-        psproc   = psutil.Process(proc.pid)
-        psproc.cpu_percent()  # discard first sample
-
-        while proc.poll() is None:
-            time.sleep(cfg["check_interval"])
-            state["uptime"] = int(time.time() - start_time) if start_time else 0
-            try:
-                s = mc_server.status()
-                state["status"]      = "online"
-                state["players"]     = s.players.online
-                state["max_players"] = s.players.max
-                state["player_list"] = [p.name for p in s.players.sample] if s.players.sample else []
-                state["latency"]     = round(s.latency, 1)
-                state["version"]     = s.version.name if s.version else ""
-                state["motd"]        = MOTD_RE.sub("", str(s.description)).strip()
-                tps = max(0, min(20, 20 - (s.latency / 50)))
-                state["tps"] = round(tps, 2)
-                with state_lock:
-                    state["history"].append(state["tps"])
-                    if len(state["history"]) > 50: state["history"].pop(0)
-                failures = 0
-            except Exception:
-                failures += 1
-                if failures >= 3: state["status"] = "offline"
-                if failures >= 5:
-                    log_event("CRASH", "Server stopped responding")
-                    proc.kill(); break
-
-            try:
-                cpu = round(psproc.cpu_percent(), 1)
-                ram = round(psproc.memory_info().rss / (1024 ** 3), 2)
-                state["cpu"] = cpu
-                state["ram"] = ram
-                with state_lock:
-                    state["cpu_history"].append(cpu)
-                    if len(state["cpu_history"]) > 50: state["cpu_history"].pop(0)
-                    state["ram_history"].append(ram)
-                    if len(state["ram_history"]) > 50: state["ram_history"].pop(0)
-            except Exception: pass
-
-        state["status"]      = "offline"
-        state["player_list"] = []
-        log_event("OFFLINE", "Server process ended")
-        with state_lock: crash_times.append(time.time())
-        restart_event.wait(timeout=5)
-        restart_event.clear()
-
-# ── Shared HTML fragments ─────────────────────────────────────────────────────
+# ── Shared HTML fragments ──────────────────────────────────────────────────────
 _HEAD_CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
@@ -373,6 +418,10 @@ nav{display:flex;gap:2px}
 .nav-link{padding:6px 14px;border-radius:6px;font-size:.82rem;color:#8b949e;text-decoration:none;transition:all .15s}
 .nav-link:hover{color:#e6edf3;background:#21262d}
 .nav-link.active{color:#e6edf3;background:#21262d}
+.srv-bar{background:#161b22;border-bottom:1px solid #30363d;padding:0 28px;display:flex;gap:4px;flex-wrap:wrap}
+.srv-tab{padding:7px 16px;border:none;background:transparent;color:#8b949e;font-size:.8rem;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s;border-bottom:2px solid transparent;margin-bottom:-1px}
+.srv-tab:hover{color:#e6edf3}
+.srv-tab.active{color:#e6edf3;border-bottom-color:#58a6ff}
 .toasts{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:999}
 .toast{background:#161b22;border:1px solid #30363d;border-radius:7px;padding:11px 16px;font-size:.82rem;min-width:210px;animation:slidein .25s ease}
 .toast.ok{border-left:3px solid #3fb950}.toast.err{border-left:3px solid #f85149}.toast.info{border-left:3px solid #58a6ff}
@@ -397,6 +446,7 @@ _HEADER_HTML = """
     <a href="/logout"><button class="btn-sm btn-logout">Sign out</button></a>
   </div>
 </header>
+<div class="srv-bar" id="serverBar"></div>
 """
 
 _TOAST_JS = """
@@ -443,7 +493,38 @@ async function changePassword(){
 }
 """
 
-# ── Login page ────────────────────────────────────────────────────────────────
+_SERVER_BAR_JS = """
+let currentSid=0;
+async function loadServerBar(){
+  try{
+    const list=await fetch('/api/servers').then(r=>r.json());
+    const bar=document.getElementById('serverBar');
+    if(!bar)return;
+    if(list.length<=1){bar.style.display='none';return;}
+    bar.innerHTML=list.map((s,i)=>
+      '<button class="srv-tab'+(i===currentSid?' active':'')+'" onclick="selectServer('+i+')" id="srvTab'+i+'">'
+      +'<span class="dot '+s.status+'" style="width:7px;height:7px;display:inline-block"></span> '+s.name
+      +'</button>'
+    ).join('');
+  }catch(e){}
+}
+function _updateServerTabDots(list){
+  list.forEach(function(s,i){
+    const tab=document.getElementById('srvTab'+i);
+    if(!tab)return;
+    const dot=tab.querySelector('.dot');
+    if(dot) dot.className='dot '+s.status;
+  });
+}
+async function refreshServerBar(){
+  try{
+    const list=await fetch('/api/servers').then(r=>r.json());
+    _updateServerTabDots(list);
+  }catch(e){}
+}
+"""
+
+# ── Login page ─────────────────────────────────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -478,14 +559,14 @@ button:hover{opacity:.85}
 </body>
 </html>"""
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# ── Dashboard ──────────────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ATMons &mdash; Overview</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%2358a6ff'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2020/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%2358a6ff'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EA%3C/text%3E%3C/svg%3E">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 """ + _HEAD_CSS + """
@@ -650,7 +731,20 @@ main{max-width:1200px;margin:0 auto;padding:24px}
 <script>
 const MAX_RAM=8;
 let charts={}, lastChatLen=0, lastEventLen=0, backupsEnabled=true, lastPollOk=Date.now();
-""" + _STATUS_JS + _TOAST_JS + """
+""" + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
+function selectServer(sid){
+  currentSid=sid;
+  lastChatLen=0; lastEventLen=0;
+  document.getElementById('chatLog').innerHTML='';
+  document.getElementById('eventLog').innerHTML='';
+  document.getElementById('playerList').innerHTML='<span class="empty-note">Loading\u2026</span>';
+  ['tps','cpu','ram'].forEach(function(k){
+    if(charts[k]){charts[k].data.labels=[];charts[k].data.datasets[0].data=[];charts[k].update();}
+  });
+  document.querySelectorAll('.srv-tab').forEach(function(t,i){t.classList.toggle('active',i===sid);});
+  lastStatus=null;
+  poll(); pollBackups();
+}
 function mkChart(id,color,yMax,unit){
   return new Chart(document.getElementById(id),{
     type:'line',
@@ -675,8 +769,7 @@ function switchTab(name,btn){
   btn.classList.add('active');
   charts[name].resize();
 }
-function updChart(c,data){ if(!c)return; c.data.labels=data.map((_,i)=>i); c.data.datasets[0].data=data; c.update(); }
-
+function updChart(c,data){if(!c)return;c.data.labels=data.map((_,i)=>i);c.data.datasets[0].data=data;c.update();}
 function fmtUptime(s){
   if(!s&&s!==0)return'\u2014';
   const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60;
@@ -690,7 +783,6 @@ function fmtCountdown(s){
   if(m)return'Next backup: '+m+'m '+sec+'s';
   return'Next backup: '+sec+'s';
 }
-
 function switchFeed(name,btn){
   document.querySelectorAll('.feed-tab').forEach(b=>b.classList.remove('active'));
   document.querySelectorAll('.feed-pane').forEach(p=>p.classList.remove('active'));
@@ -702,7 +794,7 @@ function renderEvents(events){
   if(events.length===lastEventLen)return;
   const atBottom=log.scrollHeight-log.scrollTop<=log.clientHeight+10;
   events.slice(lastEventLen).forEach(function(ev){
-    const line=document.createElement('div'); line.className='event-line';
+    const line=document.createElement('div');line.className='event-line';
     line.innerHTML='<span class="event-time">'+ev.time+'</span>'
       +'<span class="event-player">'+ev.player+'</span>'
       +'<span class="event-msg">'+ev.msg+'</span>';
@@ -721,7 +813,7 @@ function renderChat(messages){
   if(messages.length===lastChatLen)return;
   const atBottom=log.scrollHeight-log.scrollTop<=log.clientHeight+10;
   messages.slice(lastChatLen).forEach(function(m){
-    const line=document.createElement('div'); line.className='chat-line';
+    const line=document.createElement('div');line.className='chat-line';
     line.innerHTML='<span class="chat-time">'+m.time+'</span>'
       +'<span class="chat-player">&lt;'+m.player+'&gt;</span>'
       +'<span class="chat-msg">'+m.msg+'</span>';
@@ -733,34 +825,27 @@ function renderChat(messages){
 function renderBackups(list){
   const tbody=document.getElementById('backupList');
   if(!list||!list.length){
-    tbody.innerHTML='<tr><td colspan="4" style="color:#484f58">No backups found.</td></tr>'; return;
+    tbody.innerHTML='<tr><td colspan="4" style="color:#484f58">No backups found.</td></tr>';return;
   }
   tbody.innerHTML=list.map(function(b){
     return '<tr><td>'+b.name+'</td><td>'+b.size+' MB</td><td>'+b.time+'</td>'
-      +'<td><a class="backup-dl" href="/backup/download/'+b.name+'" download>Download</a>'
+      +'<td><a class="backup-dl" href="/backup/'+currentSid+'/download/'+b.name+'" download>Download</a>'
       +'<button class="backup-del" onclick="deleteBackup('+JSON.stringify(b.name)+')">Delete</button></td></tr>';
   }).join('');
 }
 async function deleteBackup(name){
   if(!confirm('Delete '+name+'?'))return;
   try{
-    const r=await fetch('/backup/delete/'+name,{method:'POST'}).then(r=>r.json());
+    const r=await fetch('/backup/'+currentSid+'/delete/'+name,{method:'POST'}).then(r=>r.json());
     if(r.ok){toast('Backup deleted','ok');pollBackups();}
     else toast('Delete failed: '+r.error,'err');
   }catch(e){toast('Delete failed','err');}
 }
-
-function showErr(msg){
-  const b=document.getElementById('errBar');
-  if(b){b.style.display='block';b.textContent=msg;}
-}
-function clearErr(){
-  const b=document.getElementById('errBar');
-  if(b)b.style.display='none';
-}
+function showErr(msg){const b=document.getElementById('errBar');if(b){b.style.display='block';b.textContent=msg;}}
+function clearErr(){const b=document.getElementById('errBar');if(b)b.style.display='none';}
 async function poll(){
   try{
-    const r=await fetch('/api');
+    const r=await fetch('/api/'+currentSid);
     if(r.status===401){window.location='/login';return;}
     if(!r.ok){
       let errText='HTTP '+r.status;
@@ -825,7 +910,7 @@ async function poll(){
   }catch(e){console.error('poll error:',e);showErr('Poll exception: '+e.message);}
 }
 async function pollBackups(){
-  try{ renderBackups(await fetch('/api/backups').then(r=>r.json())); }catch(e){}
+  try{renderBackups(await fetch('/api/'+currentSid+'/backups').then(r=>r.json()));}catch(e){}
 }
 async function act(action){
   if(action==='stop'&&!confirm('Stop the server?'))return;
@@ -834,7 +919,7 @@ async function act(action){
   const btn=document.getElementById(ids[action]);
   if(btn)btn.disabled=true;
   try{
-    await fetch('/'+action);
+    await fetch('/server/'+currentSid+'/'+action);
     const msgs={restart:'Restarting\u2026',stop:'Stopping\u2026',backup:'Backup started!',start:'Starting\u2026'};
     toast(msgs[action]||'Done','info');
     if(action==='backup')setTimeout(pollBackups,4000);
@@ -843,11 +928,10 @@ async function act(action){
 }
 async function toggleBackups(){
   try{
-    const r=await fetch('/toggle_backups').then(r=>r.json());
+    const r=await fetch('/server/'+currentSid+'/toggle_backups').then(r=>r.json());
     toast('Auto-backup '+(r.enabled?'enabled':'disabled'),'info');
   }catch(e){toast('Failed','err');}
 }
-
 async function fetchMe(){
   try{
     const d=await fetch('/api/me').then(r=>r.json());
@@ -864,8 +948,8 @@ async function fetchMe(){
   }catch(e){}
 }
 try{initCharts();}catch(e){console.error('Chart.js unavailable:',e);}
-fetchMe(); poll(); pollBackups();
-setInterval(poll,5000); setInterval(pollBackups,30000);
+fetchMe(); loadServerBar(); poll(); pollBackups();
+setInterval(poll,5000); setInterval(pollBackups,30000); setInterval(refreshServerBar,10000);
 setInterval(function(){
   const age=(Date.now()-lastPollOk)/1000;
   const el=document.getElementById('lastUpdate');
@@ -878,7 +962,7 @@ setInterval(function(){
 </body>
 </html>"""
 
-# ── Console page ──────────────────────────────────────────────────────────────
+# ── Console page ───────────────────────────────────────────────────────────────
 CONSOLE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -890,6 +974,7 @@ CONSOLE_HTML = """<!DOCTYPE html>
 """ + _HEAD_CSS + """
 body{height:100vh;display:flex;flex-direction:column}
 header{flex-shrink:0}
+.srv-bar{flex-shrink:0}
 .console-wrap{flex:1;display:flex;flex-direction:column;padding:14px 16px;gap:8px;min-height:0;overflow:hidden}
 .page-tabs{display:flex;border-bottom:1px solid #30363d;flex-shrink:0;margin-bottom:4px}
 .page-tab{padding:8px 18px;border:none;background:transparent;color:#8b949e;font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;margin-bottom:-1px}
@@ -968,7 +1053,15 @@ header{flex-shrink:0}
 
 <script>
 let lastLogLen=0, wlogLen=0, cmdHistory=[], histIdx=-1;
-""" + _STATUS_JS + _TOAST_JS + """
+""" + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
+function selectServer(sid){
+  currentSid=sid;
+  lastLogLen=0;
+  document.getElementById('consoleLog').innerHTML='';
+  document.querySelectorAll('.srv-tab').forEach(function(t,i){t.classList.toggle('active',i===sid);});
+  lastStatus=null;
+  poll();
+}
 function lineClass(line){
   if(/WARN/.test(line))        return 'warn';
   if(/ERROR|FATAL/.test(line)) return 'err';
@@ -1013,14 +1106,14 @@ function setFilter(name,btn){
   log.classList.remove('filter-warn','filter-err');
   if(name!=='all')log.classList.add('filter-'+name);
 }
-function clearLog(){ document.getElementById('consoleLog').innerHTML=''; }
+function clearLog(){document.getElementById('consoleLog').innerHTML='';}
 function exportLog(){
   const lines=Array.from(document.getElementById('consoleLog').querySelectorAll('.log-line'))
     .map(el=>el.textContent).join('\\n');
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([lines],{type:'text/plain'}));
   a.download='server-'+new Date().toISOString().slice(0,19).replace(/[:.]/g,'-')+'.log';
-  a.click(); URL.revokeObjectURL(a.href);
+  a.click();URL.revokeObjectURL(a.href);
 }
 function exportWatchdogLog(){
   const lines=Array.from(document.getElementById('watchdogLog').querySelectorAll('.wlog-line'))
@@ -1028,7 +1121,7 @@ function exportWatchdogLog(){
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([lines],{type:'text/plain'}));
   a.download='watchdog-'+new Date().toISOString().slice(0,10)+'.log';
-  a.click(); URL.revokeObjectURL(a.href);
+  a.click();URL.revokeObjectURL(a.href);
 }
 function switchPage(name,btn){
   document.querySelectorAll('.page-tab').forEach(b=>b.classList.remove('active'));
@@ -1039,7 +1132,7 @@ function switchPage(name,btn){
 }
 async function poll(){
   try{
-    const data=await fetch('/api/log').then(r=>r.json());
+    const data=await fetch('/api/'+currentSid+'/log').then(r=>r.json());
     updateStatus(data.status);
     renderLog(data.log||[]);
   }catch(e){}
@@ -1060,7 +1153,7 @@ async function sendCmd(){
   const btn=document.getElementById('btnSend');
   btn.disabled=true;
   try{
-    const r=await fetch('/command',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/server/'+currentSid+'/command',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({cmd})});
     const data=await r.json();
     if(data.ok) toast('Sent: '+cmd,'info');
@@ -1093,228 +1186,12 @@ async function fetchMe(){
     if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
   }catch(e){}
 }
-fetchMe(); poll(); setInterval(poll,2000); setInterval(pollWatchdogLog,10000);
+fetchMe(); loadServerBar(); poll(); setInterval(poll,2000); setInterval(pollWatchdogLog,10000); setInterval(refreshServerBar,10000);
 </script>
 </body>
 </html>"""
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-_MAX_ATTEMPTS = 5
-_LOCKOUT_SECS = 300
-
-@app.route("/login", methods=["GET","POST"])
-def login():
-    ip    = request.remote_addr
-    now   = time.time()
-    count, locked_until = _login_attempts.get(ip, [0, 0.0])
-    error = ""
-    if now < locked_until:
-        error = f"Too many failed attempts. Try again in {int(locked_until - now)}s."
-        return render_template_string(LOGIN_HTML, error=error)
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        user = _get_user(username)
-        if user and _check_password(password, user["password"]):
-            _login_attempts.pop(ip, None)
-            session.permanent = True
-            session["authenticated"] = True
-            session["username"] = user["username"]
-            session["role"]     = user["role"]
-            return redirect("/")
-        count += 1
-        locked_until = now + _LOCKOUT_SECS if count >= _MAX_ATTEMPTS else 0.0
-        _login_attempts[ip] = [count, locked_until]
-        remaining = _MAX_ATTEMPTS - count
-        error = (f"Invalid credentials. ({remaining} attempt{'s' if remaining != 1 else ''} left)"
-                 if remaining > 0 else f"Locked for {_LOCKOUT_SECS // 60} minutes.")
-    return render_template_string(LOGIN_HTML, error=error)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
-
-@app.route("/")
-@require_auth
-def home():
-    return DASHBOARD_HTML
-
-@app.route("/console")
-@require_role("admin", "owner")
-def console():
-    return CONSOLE_HTML
-
-def _sanitize(v):
-    """Recursively sanitize a value so jsonify never raises."""
-    if isinstance(v, str):
-        return v.encode("utf-8", "replace").decode("utf-8", "replace")
-    if isinstance(v, list):
-        return [_sanitize(i) for i in v]
-    if isinstance(v, dict):
-        return {k: _sanitize(val) for k, val in v.items()}
-    return v
-
-@app.route("/api")
-@require_auth
-def api():
-    try:
-        with state_lock:
-            data = {k: _sanitize(list(v) if isinstance(v, list) else v)
-                    for k, v in state.items() if k != "log"}
-        if data.get("backups_enabled") and last_backup_time:
-            data["next_backup_in"] = max(0, int(cfg["backup_interval"] - (time.time() - last_backup_time)))
-        elif data.get("backups_enabled"):
-            data["next_backup_in"] = cfg["backup_interval"]
-        else:
-            data["next_backup_in"] = None
-        return jsonify(data)
-    except Exception as e:
-        log_event("ERROR", f"/api failed: {e}")
-        return jsonify({"status": state.get("status", "offline"), "error": str(e)}), 500
-
-@app.route("/api/log")
-@require_auth
-def api_log():
-    with state_lock:
-        return jsonify({"log": list(state["log"]), "status": state["status"]})
-
-@app.route("/api/watchdog_log")
-@require_auth
-def api_watchdog_log():
-    if not os.path.exists(WATCHDOG_LOG):
-        return jsonify({"lines": []})
-    try:
-        with open(WATCHDOG_LOG, "r", encoding="utf-8") as f:
-            lines = [l.rstrip() for l in f.readlines()]
-        return jsonify({"lines": lines[-500:]})
-    except Exception as e:
-        return jsonify({"lines": [], "error": str(e)})
-
-@app.route("/api/backups")
-@require_auth
-def list_backups():
-    if not os.path.exists(cfg["backup_dir"]):
-        return jsonify([])
-    files = []
-    for f in sorted(os.listdir(cfg["backup_dir"]), reverse=True):
-        if f.endswith(".zip"):
-            path = os.path.join(cfg["backup_dir"], f)
-            files.append({
-                "name": f,
-                "size": round(os.path.getsize(path) / (1024 ** 2), 1),
-                "time": datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M"),
-            })
-    return jsonify(files[:20])
-
-@app.route("/backup/download/<filename>")
-@require_auth
-def download_backup(filename):
-    if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
-        return "Invalid filename", 400
-    path = os.path.join(cfg["backup_dir"], filename)
-    if not os.path.exists(path):
-        return "Not found", 404
-    return send_file(os.path.abspath(path), as_attachment=True)
-
-@app.route("/backup/delete/<filename>", methods=["POST"])
-@require_role("admin", "owner")
-def delete_backup(filename):
-    if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
-        return jsonify({"ok": False, "error": "Invalid filename"}), 400
-    path = os.path.join(cfg["backup_dir"], filename)
-    if not os.path.exists(path):
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    try:
-        os.remove(path)
-        log_event("BACKUP", f"Deleted {filename}")
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/command", methods=["POST"])
-@require_role("admin", "owner")
-def command():
-    global _last_cmd_time
-    now = time.time()
-    if now - _last_cmd_time < 0.5:
-        return jsonify({"ok": False, "error": "Too fast, slow down"}), 429
-    _last_cmd_time = now
-    cmd = request.json.get("cmd", "").strip()
-    if not cmd: return jsonify({"ok": False, "error": "Empty command"}), 400
-    if not proc or proc.poll() is not None:
-        return jsonify({"ok": False, "error": "Server not running"}), 400
-    try:
-        proc.stdin.write((cmd + "\n").encode()); proc.stdin.flush()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/stop")
-@require_role("admin", "owner")
-def stop_server():
-    threading.Thread(target=stop, daemon=True).start()
-    return "stopping"
-
-@app.route("/restart")
-@require_role("admin", "owner")
-def restart():
-    threading.Thread(target=stop, daemon=True).start()
-    return "restarting"
-
-@app.route("/backup")
-@require_role("admin", "owner")
-def do_backup():
-    threading.Thread(target=backup, daemon=True).start()
-    return "backup started"
-
-@app.route("/toggle_backups")
-@require_role("admin", "owner")
-def toggle_backups():
-    state["backups_enabled"] = not state["backups_enabled"]
-    cfg["backups_enabled"] = state["backups_enabled"]
-    save_config(cfg)
-    return jsonify({"enabled": state["backups_enabled"]})
-
-@app.route("/start")
-@require_role("admin", "owner")
-def start_server():
-    if state["status"] in ("online", "starting"):
-        return "already running"
-    with state_lock:
-        crash_times.clear()
-        state["crash_count"] = 0
-    if proc and proc.poll() is None:
-        proc.kill()
-    restart_event.set()
-    log_event("START", "Manual start requested from dashboard")
-    return "starting"
-
-@app.route("/api/me")
-@require_auth
-def api_me():
-    return jsonify({"username": session.get("username"), "role": session.get("role")})
-
-@app.route("/api/me/password", methods=["POST"])
-@require_auth
-def api_change_password():
-    data = request.json or {}
-    current  = data.get("current", "")
-    new_pw   = data.get("new_password", "")
-    if not current or not new_pw:
-        return jsonify({"ok": False, "error": "Missing fields"}), 400
-    if len(new_pw) < 8:
-        return jsonify({"ok": False, "error": "Password must be at least 8 characters"}), 400
-    user = _get_user(session.get("username"))
-    if not user or not _check_password(current, user["password"]):
-        return jsonify({"ok": False, "error": "Current password is incorrect"}), 403
-    user["password"] = _hash_password(new_pw)
-    save_config(cfg)
-    session.clear()
-    log_event("SECURITY", f"Password changed for user '{user['username']}'")
-    return jsonify({"ok": True})
-
-# ── Admin user management ─────────────────────────────────────────────────────
+# ── Admin page ─────────────────────────────────────────────────────────────────
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1385,7 +1262,7 @@ select.form-input{cursor:pointer}
 </main>
 <div class="toasts" id="toasts"></div>
 <script>
-""" + _TOAST_JS + """
+""" + _TOAST_JS + _SERVER_BAR_JS + """
 async function fetchMe(){
   try{
     const d=await fetch('/api/me').then(r=>r.json());
@@ -1410,11 +1287,11 @@ async function loadUsers(){
       let actions='';
       if(isSelf){
         actions='<span style="color:#484f58;font-size:.75rem">current user</span>';
-      } else if(canAct){
+      }else if(canAct){
         actions+='<button class="btn-sm btn-sm-blue" onclick="resetPassword('+i+')">Reset PW</button>';
         if(!isOwner) actions+='<button class="btn-sm" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9" onclick="toggleRole('+i+')">'+(u.role==='admin'?'Make Viewer':'Make Admin')+'</button>';
         actions+='<button class="btn-sm btn-sm-red" onclick="deleteUser('+i+')">Delete</button>';
-      } else {
+      }else{
         actions='<span style="color:#484f58;font-size:.75rem">protected</span>';
       }
       return '<tr>'
@@ -1468,34 +1345,264 @@ async function toggleRole(i){
     else toast('Error: '+r.error,'err');
   }catch(e){toast('Failed','err');}
 }
-async function pollStatus(){
-  try{
-    const d=await fetch('/api').then(r=>r.json());
-    const dot=document.getElementById('dot');
-    const txt=document.getElementById('statusText');
-    if(dot&&txt){
-      const on=d.status==='online';
-      dot.className='dot '+(on?'online':'offline');
-      txt.textContent=on?'Online':'Offline';
-    }
-  }catch(e){}
-}
-fetchMe(); loadUsers(); pollStatus();
+fetchMe(); loadServerBar(); loadUsers();
 </script>
 </body>
 </html>"""
 
-# ── Apply server_name branding ────────────────────────────────────────────────
-_sn = cfg.get("server_name") or "ATMons"
+# ── Apply server_name branding ─────────────────────────────────────────────────
+_sn = cfg.get("server_name") or "Minecraft Watchdog"
 LOGIN_HTML     = LOGIN_HTML    .replace("ATMons", _sn)
 DASHBOARD_HTML = DASHBOARD_HTML.replace("ATMons", _sn)
 CONSOLE_HTML   = CONSOLE_HTML  .replace("ATMons", _sn)
 ADMIN_HTML     = ADMIN_HTML    .replace("ATMons", _sn)
 
+# ── Routes ─────────────────────────────────────────────────────────────────────
+_MAX_ATTEMPTS = 5
+_LOCKOUT_SECS = 300
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    ip    = request.remote_addr
+    now   = time.time()
+    count, locked_until = _login_attempts.get(ip, [0, 0.0])
+    error = ""
+    if now < locked_until:
+        error = f"Too many failed attempts. Try again in {int(locked_until - now)}s."
+        return render_template_string(LOGIN_HTML, error=error)
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = _get_user(username)
+        if user and _check_password(password, user["password"]):
+            _login_attempts.pop(ip, None)
+            session.permanent = True
+            session["authenticated"] = True
+            session["username"] = user["username"]
+            session["role"]     = user["role"]
+            return redirect("/")
+        count += 1
+        locked_until = now + _LOCKOUT_SECS if count >= _MAX_ATTEMPTS else 0.0
+        _login_attempts[ip] = [count, locked_until]
+        remaining = _MAX_ATTEMPTS - count
+        error = (f"Invalid credentials. ({remaining} attempt{'s' if remaining != 1 else ''} left)"
+                 if remaining > 0 else f"Locked for {_LOCKOUT_SECS // 60} minutes.")
+    return render_template_string(LOGIN_HTML, error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+@app.route("/")
+@require_auth
+def home():
+    return DASHBOARD_HTML
+
+@app.route("/console")
+@require_role("admin", "owner")
+def console():
+    return CONSOLE_HTML
+
 @app.route("/admin")
 @require_role("admin", "owner")
 def admin_page():
     return ADMIN_HTML
+
+# ── API ────────────────────────────────────────────────────────────────────────
+def _sanitize(v):
+    if isinstance(v, str):  return v.encode("utf-8", "replace").decode("utf-8", "replace")
+    if isinstance(v, list): return [_sanitize(i) for i in v]
+    if isinstance(v, dict): return {k: _sanitize(val) for k, val in v.items()}
+    return v
+
+@app.route("/api/servers")
+@require_auth
+def api_servers():
+    return jsonify([{"id": i, "name": s.name, "status": s.state["status"]} for i, s in enumerate(servers)])
+
+@app.route("/api/<int:sid>")
+@require_auth
+def api(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    try:
+        with srv.state_lock:
+            data = {k: _sanitize(list(v) if isinstance(v, list) else v)
+                    for k, v in srv.state.items() if k != "log"}
+        bi = srv.scfg["backup_interval"]
+        if data.get("backups_enabled") and srv.last_backup_time:
+            data["next_backup_in"] = max(0, int(bi - (time.time() - srv.last_backup_time)))
+        elif data.get("backups_enabled"):
+            data["next_backup_in"] = bi
+        else:
+            data["next_backup_in"] = None
+        return jsonify(data)
+    except Exception as e:
+        log_event("ERROR", f"/api/{sid} failed: {e}")
+        return jsonify({"status": srv.state.get("status", "offline"), "error": str(e)}), 500
+
+@app.route("/api/<int:sid>/log")
+@require_auth
+def api_log(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    with srv.state_lock:
+        return jsonify({"log": list(srv.state["log"]), "status": srv.state["status"]})
+
+@app.route("/api/watchdog_log")
+@require_auth
+def api_watchdog_log():
+    if not os.path.exists(WATCHDOG_LOG):
+        return jsonify({"lines": []})
+    try:
+        with open(WATCHDOG_LOG, "r", encoding="utf-8") as f:
+            lines = [l.rstrip() for l in f.readlines()]
+        return jsonify({"lines": lines[-500:]})
+    except Exception as e:
+        return jsonify({"lines": [], "error": str(e)})
+
+@app.route("/api/<int:sid>/backups")
+@require_auth
+def list_backups(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    backup_dir = os.path.join(srv.server_dir, srv.scfg["backup_dir"])
+    if not os.path.exists(backup_dir):
+        return jsonify([])
+    files = []
+    for f in sorted(os.listdir(backup_dir), reverse=True):
+        if f.endswith(".zip"):
+            path = os.path.join(backup_dir, f)
+            files.append({
+                "name": f,
+                "size": round(os.path.getsize(path) / (1024 ** 2), 1),
+                "time": datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M"),
+            })
+    return jsonify(files[:20])
+
+@app.route("/backup/<int:sid>/download/<filename>")
+@require_auth
+def download_backup(sid, filename):
+    srv, err = _get_server(sid)
+    if err: return err
+    if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
+        return "Invalid filename", 400
+    path = os.path.join(srv.server_dir, srv.scfg["backup_dir"], filename)
+    if not os.path.exists(path):
+        return "Not found", 404
+    return send_file(os.path.abspath(path), as_attachment=True)
+
+@app.route("/backup/<int:sid>/delete/<filename>", methods=["POST"])
+@require_role("admin", "owner")
+def delete_backup(sid, filename):
+    srv, err = _get_server(sid)
+    if err: return err
+    if "/" in filename or "\\" in filename or not filename.endswith(".zip"):
+        return jsonify({"ok": False, "error": "Invalid filename"}), 400
+    path = os.path.join(srv.server_dir, srv.scfg["backup_dir"], filename)
+    if not os.path.exists(path):
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    try:
+        os.remove(path)
+        srv._log("BACKUP", f"Deleted {filename}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/server/<int:sid>/command", methods=["POST"])
+@require_role("admin", "owner")
+def command(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    now = time.time()
+    if now - srv._last_cmd_time < 0.5:
+        return jsonify({"ok": False, "error": "Too fast, slow down"}), 429
+    srv._last_cmd_time = now
+    cmd = request.json.get("cmd", "").strip()
+    if not cmd: return jsonify({"ok": False, "error": "Empty command"}), 400
+    if not srv.proc or srv.proc.poll() is not None:
+        return jsonify({"ok": False, "error": "Server not running"}), 400
+    try:
+        srv.proc.stdin.write((cmd + "\n").encode()); srv.proc.stdin.flush()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/server/<int:sid>/stop")
+@require_role("admin", "owner")
+def stop_server(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    threading.Thread(target=srv.stop, daemon=True).start()
+    return "stopping"
+
+@app.route("/server/<int:sid>/restart")
+@require_role("admin", "owner")
+def restart(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    threading.Thread(target=srv.stop, daemon=True).start()
+    return "restarting"
+
+@app.route("/server/<int:sid>/backup")
+@require_role("admin", "owner")
+def do_backup(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    threading.Thread(target=srv.backup, daemon=True).start()
+    return "backup started"
+
+@app.route("/server/<int:sid>/toggle_backups")
+@require_role("admin", "owner")
+def toggle_backups(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    srv.state["backups_enabled"] = not srv.state["backups_enabled"]
+    srv.scfg["backups_enabled"]  = srv.state["backups_enabled"]
+    save_config(cfg)
+    return jsonify({"enabled": srv.state["backups_enabled"]})
+
+@app.route("/server/<int:sid>/start")
+@require_role("admin", "owner")
+def start_server(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if srv.state["status"] in ("online", "starting"):
+        return "already running"
+    with srv.state_lock:
+        srv.crash_times.clear()
+        srv.state["crash_count"] = 0
+    if srv.proc and srv.proc.poll() is None:
+        srv.proc.kill()
+    srv.restart_event.set()
+    srv._log("START", "Manual start requested from dashboard")
+    return "starting"
+
+# ── User / auth API ────────────────────────────────────────────────────────────
+@app.route("/api/me")
+@require_auth
+def api_me():
+    return jsonify({"username": session.get("username"), "role": session.get("role")})
+
+@app.route("/api/me/password", methods=["POST"])
+@require_auth
+def api_change_password():
+    data    = request.json or {}
+    current = data.get("current", "")
+    new_pw  = data.get("new_password", "")
+    if not current or not new_pw:
+        return jsonify({"ok": False, "error": "Missing fields"}), 400
+    if len(new_pw) < 8:
+        return jsonify({"ok": False, "error": "Password must be at least 8 characters"}), 400
+    user = _get_user(session.get("username"))
+    if not user or not _check_password(current, user["password"]):
+        return jsonify({"ok": False, "error": "Current password is incorrect"}), 403
+    user["password"] = _hash_password(new_pw)
+    save_config(cfg)
+    session.clear()
+    log_event("SECURITY", f"Password changed for user '{user['username']}'")
+    return jsonify({"ok": True})
 
 @app.route("/api/admin/users")
 @require_role("admin", "owner")
@@ -1505,7 +1612,7 @@ def api_admin_users():
 @app.route("/api/admin/users/add", methods=["POST"])
 @require_role("admin", "owner")
 def api_admin_add_user():
-    data = request.json or {}
+    data     = request.json or {}
     username = data.get("username", "").strip()
     password = data.get("password", "")
     role     = data.get("role", "viewer")
@@ -1513,8 +1620,6 @@ def api_admin_add_user():
         return jsonify({"ok": False, "error": "Username and password required"}), 400
     if role not in ("admin", "viewer"):
         return jsonify({"ok": False, "error": "Role must be admin or viewer"}), 400
-    if role == "owner":
-        return jsonify({"ok": False, "error": "Cannot create new owner accounts"}), 403
     if _get_user(username):
         return jsonify({"ok": False, "error": "Username already exists"}), 409
     cfg["users"].append({"username": username, "password": _hash_password(password), "role": role})
@@ -1527,7 +1632,7 @@ def api_admin_add_user():
 def api_admin_update_user():
     data     = request.json or {}
     username = data.get("username", "").strip()
-    user = _get_user(username)
+    user     = _get_user(username)
     if not user:
         return jsonify({"ok": False, "error": "User not found"}), 404
     if user["role"] == "owner" and session.get("role") != "owner":
@@ -1560,12 +1665,18 @@ def api_admin_delete_user():
     log_event("ADMIN", f"User '{username}' deleted by {session.get('username')}")
     return jsonify({"ok": True})
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    os.makedirs(cfg["backup_dir"], exist_ok=True)
-    log_event("WATCHDOG", f"{cfg.get('server_name') or 'ATMons'} starting up")
-    threading.Thread(target=monitor,          daemon=True).start()
-    threading.Thread(target=backup_scheduler, daemon=True).start()
+    for i, scfg in enumerate(cfg["servers"]):
+        srv = ServerInstance(i, scfg)
+        servers.append(srv)
+        os.makedirs(os.path.join(srv.server_dir, scfg["backup_dir"]), exist_ok=True)
+        threading.Thread(target=srv.monitor,           daemon=True).start()
+        threading.Thread(target=srv.backup_scheduler,  daemon=True).start()
+        log_event("WATCHDOG", f"[{srv.name}] Instance initialised (dir: {srv.server_dir})")
+
+    sn = cfg.get("server_name") or "Minecraft Watchdog"
+    log_event("WATCHDOG", f"{sn} starting up — {len(servers)} server(s)")
     try:
         from waitress import serve
         log_event("WATCHDOG", f"Dashboard running at http://0.0.0.0:{cfg['port']}")
