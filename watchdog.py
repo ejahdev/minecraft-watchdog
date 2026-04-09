@@ -908,7 +908,7 @@ function renderBackups(list){
   tbody.innerHTML=list.map(function(b){
     return '<tr><td>'+b.name+'</td><td>'+b.size+' MB</td><td>'+b.time+'</td>'
       +'<td><a class="backup-dl" href="/backup/'+currentSid+'/download/'+b.name+'" download>Download</a>'
-      +'<button class="backup-del" onclick="deleteBackup('+JSON.stringify(b.name)+')">Delete</button></td></tr>';
+      +'<button class="backup-del" onclick="deleteBackup(\\''+b.name+'\\')">Delete</button></td></tr>';
   }).join('');
 }
 async function deleteBackup(name){
