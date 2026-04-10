@@ -146,7 +146,7 @@ ANSI_RE  = re.compile(r'\x1b\[[0-9;]*m')
 MOTD_RE  = re.compile(r'\u00a7.')
 EVENT_RE = re.compile(
     r'\[.+?/INFO\].*?:\s'
-    r'(?:\[\d+\]\s)?(?P<player>\w+)\s(?P<msg>'
+    r'(?:\[.*?\]\s)*(?P<player>\w+)\s(?P<msg>'
     r'(?:was (?:slain|shot|blown up|killed|struck|burned|suffocated|drowned|pricked|squashed|starved|impaled|frozen|hit|fireballed|pummeled|finished off|obliterated|skewered|poked|squished|smashed|speared|stung).+'
     r'|drowned(?:\s.+)?'
     r'|died(?:\s.+)?'
