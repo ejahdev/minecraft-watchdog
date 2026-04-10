@@ -409,8 +409,11 @@ class ServerInstance:
                 time.sleep(self.scfg["check_interval"])
                 self.state["uptime"] = int(time.time() - self.start_time) if self.start_time else 0
                 try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                    _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
                         s = _ex.submit(self.mc_server.status).result(timeout=self.scfg["check_interval"])
+                    finally:
+                        _ex.shutdown(wait=False)
                     self.state["status"]      = "online"
                     self.state["players"]     = s.players.online
                     self.state["max_players"] = s.players.max
