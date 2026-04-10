@@ -406,14 +406,25 @@ class ServerInstance:
             psproc.cpu_percent()
 
             while self.proc.poll() is None:
+                self._log("POLL_DEBUG", f"loop tick — failures={failures}")
                 time.sleep(self.scfg["check_interval"])
+                self._log("POLL_DEBUG", f"after sleep — attempting status check")
                 self.state["uptime"] = int(time.time() - self.start_time) if self.start_time else 0
-                try:
-                    _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                _result  = [None]
+                _exc     = [None]
+                def _do_status():
                     try:
-                        s = _ex.submit(self.mc_server.status).result(timeout=self.scfg["check_interval"])
-                    finally:
-                        _ex.shutdown(wait=False)
+                        _result[0] = self.mc_server.status()
+                    except Exception as e:
+                        _exc[0] = e
+                _t = threading.Thread(target=_do_status, daemon=True)
+                _t.start()
+                _t.join(timeout=self.scfg["check_interval"])
+                self._log("POLL_DEBUG", f"status thread alive={_t.is_alive()} exc={_exc[0]}")
+                try:
+                    if _t.is_alive() or _exc[0] is not None:
+                        raise Exception(f"status timeout or error: {_exc[0]}")
+                    s = _result[0]
                     self.state["status"]      = "online"
                     self.state["players"]     = s.players.online
                     self.state["max_players"] = s.players.max
@@ -427,8 +438,9 @@ class ServerInstance:
                         self.state["history"].append(self.state["tps"])
                         if len(self.state["history"]) > 50: self.state["history"].pop(0)
                     failures = 0
-                except Exception:
+                except Exception as _poll_exc:
                     failures += 1
+                    self._log("POLL_FAIL", f"Status check failed (failures={failures}): {type(_poll_exc).__name__}: {_poll_exc}")
                     if failures >= 3: self.state["status"] = "offline"
                     if failures >= 5:
                         self._log("CRASH", "Server stopped responding")
