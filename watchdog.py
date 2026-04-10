@@ -1,4 +1,4 @@
-import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac, zipfile
+import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac, zipfile, concurrent.futures
 from functools import wraps
 from mcstatus import JavaServer
 import psutil
@@ -409,7 +409,8 @@ class ServerInstance:
                 time.sleep(self.scfg["check_interval"])
                 self.state["uptime"] = int(time.time() - self.start_time) if self.start_time else 0
                 try:
-                    s = self.mc_server.status()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                        s = _ex.submit(self.mc_server.status).result(timeout=self.scfg["check_interval"])
                     self.state["status"]      = "online"
                     self.state["players"]     = s.players.online
                     self.state["max_players"] = s.players.max
