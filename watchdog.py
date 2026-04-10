@@ -41,6 +41,8 @@ DEFAULT_SERVER_CFG = {
     "check_interval":   5,
     "max_startup_wait": 300,
     "backup_interval":  1800,
+    "restart_interval": 21600,
+    "restart_warning_times": [600, 300, 60],
     "max_crashes":      5,
     "crash_window":     300,
     "world_dir":        "world",
@@ -367,6 +369,67 @@ class ServerInstance:
             time.sleep(self.scfg["backup_interval"])
             if self.state["backups_enabled"] and self.state["status"] == "online":
                 self.backup()
+
+    def send_command(self, cmd):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.stdin.write((cmd + "\n").encode())
+                self.proc.stdin.flush()
+                return True
+        except Exception as e:
+            self._log("COMMAND", f"Failed to send command '{cmd}': {e}")
+        return False
+
+    def bossbar_warning(self, seconds_left):
+        title = f"Server restarting in {seconds_left} seconds"
+        progress = max(0.0, min(1.0, seconds_left / max(self.scfg["restart_warning_times"])))
+        self.send_command('bossbar add watchdog:restart {"text":"Server Restart","color":"red"}')
+        self.send_command(f'bossbar set watchdog:restart name {{"text":"{title}","color":"red"}}')
+        self.send_command("bossbar set watchdog:restart color red")
+        self.send_command("bossbar set watchdog:restart style progress")
+        self.send_command("bossbar set watchdog:restart max 100")
+        self.send_command(f"bossbar set watchdog:restart value {int(progress * 100)}")
+        self.send_command("bossbar set watchdog:restart players @a")
+        self.send_command(f'tellraw @a {{"text":"[Watchdog] {title}","color":"gold"}}')
+
+    def clear_restart_bossbar(self):
+        self.send_command("bossbar remove watchdog:restart")
+
+    def restart_scheduler(self):
+        interval     = self.scfg.get("restart_interval", 21600)
+        warning_times = sorted(self.scfg.get("restart_warning_times", [600, 300, 60]), reverse=True)
+        max_warning  = warning_times[0] if warning_times else 0
+
+        # Sleep until the first warning window begins
+        time.sleep(max(0, interval - max_warning))
+
+        while True:
+            self._log("RESTART_SCHED", "Scheduled restart warning sequence started")
+
+            # Send bossbar updates at each configured warning time
+            prev_seconds = max_warning
+            for seconds in warning_times:
+                gap = prev_seconds - seconds
+                if gap > 0:
+                    time.sleep(gap)
+                if self.state["status"] == "online":
+                    self.bossbar_warning(seconds)
+                prev_seconds = seconds
+
+            # Sleep the remaining gap to reach t=0
+            if prev_seconds > 0:
+                time.sleep(prev_seconds)
+
+            self.clear_restart_bossbar()
+            if self.state["status"] == "online":
+                self.send_command('tellraw @a {"text":"[Watchdog] Server is restarting now!","color":"red"}')
+
+            if self.proc and self.proc.poll() is None:
+                self._log("RESTART_SCHED", "Performing scheduled restart")
+                threading.Thread(target=self.stop, daemon=True).start()
+
+            # Sleep until next warning window
+            time.sleep(max(0, interval - max_warning))
 
     def monitor(self):
         self._log("WATCHDOG", "Watchdog started")
@@ -1977,8 +2040,9 @@ if __name__ == "__main__":
         srv = ServerInstance(i, scfg)
         servers.append(srv)
         os.makedirs(os.path.join(srv.server_dir, scfg["backup_dir"]), exist_ok=True)
-        threading.Thread(target=srv.monitor,           daemon=True).start()
+        threading.Thread(target=srv.monitor,            daemon=True).start()
         threading.Thread(target=srv.backup_scheduler,  daemon=True).start()
+        threading.Thread(target=srv.restart_scheduler, daemon=True).start()
         log_event("WATCHDOG", f"[{srv.name}] Instance initialised (dir: {srv.server_dir})")
 
     sn = cfg.get("server_name") or "Minecraft Watchdog"
