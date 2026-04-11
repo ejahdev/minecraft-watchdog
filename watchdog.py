@@ -703,8 +703,8 @@ class ServerInstance:
                         if len(self.state["history"]) > 50: self.state["history"].pop(0)
                     failures = 0
                     if time.time() - self._last_stats_cmd_time > 30:
-                        self.send_command("cu entities entityData")
-                        self.send_command("cu chunks")
+                        self.send_command("/cu entities entityData")
+                        self.send_command("/cu chunks")
                         self._last_stats_cmd_time = time.time()
                 except Exception as _poll_exc:
                     failures += 1
@@ -1431,8 +1431,8 @@ main{max-width:1100px;margin:0 auto;padding:24px}
   <div class="section" id="statsActionsSection">
     <div class="section-title">Quick Commands</div>
     <div class="actions">
-      <button class="btn btn-green" onclick="quickCmd('cu entities entityData')">Refresh Entities</button>
-      <button class="btn btn-green" onclick="quickCmd('cu chunks')">Refresh Chunks</button>
+      <button class="btn btn-green" onclick="quickCmd('/cu entities entityData')">Refresh Entities</button>
+      <button class="btn btn-green" onclick="quickCmd('/cu chunks')">Refresh Chunks</button>
       <button class="btn btn-green" onclick="quickCmd('spark health --upload --memory')">Run Spark Refresh</button>
       <button class="btn btn-green" onclick="quickCmd('save-all')">Save World</button>
       <button class="btn btn-green" onclick="quickCmd('list')">List Players</button>
