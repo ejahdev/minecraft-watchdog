@@ -142,10 +142,11 @@ app.secret_key = cfg["secret_key"]
 app.config["PERMANENT_SESSION_LIFETIME"] = datetime.timedelta(hours=12)
 
 # ── Regex ──────────────────────────────────────────────────────────────────────
-CHAT_RE  = re.compile(r'\[.+?/INFO\].*?:\s<(.+?)>\s(.+)')
-DONE_RE  = re.compile(r'Done \(')
-ANSI_RE  = re.compile(r'\x1b\[[0-9;]*m')
-MOTD_RE  = re.compile(r'\u00a7.')
+CHAT_RE         = re.compile(r'\[.+?/INFO\].*?:\s<(.+?)>\s(.+)')
+DONE_RE         = re.compile(r'Done \(')
+ANSI_RE         = re.compile(r'\x1b\[[0-9;]*m')
+MOTD_RE         = re.compile(r'\u00a7.')
+CANT_KEEP_UP_RE = re.compile(r"Can't keep up!.*?Running \d+ms or (\d+) ticks behind")
 EVENT_RE = re.compile(
     r'\[.+?/INFO\].*?:\s'
     r'(?:\[.*?\]\s)*(?P<player>\w+)\s(?P<msg>'
@@ -243,6 +244,8 @@ class ServerInstance:
         self.save_done_event  = threading.Event()
         self._last_cmd_time   = 0.0
         self._mc_server       = None
+        self._last_lag_time   = 0.0
+        self._last_ticks_behind = 0
 
     @property
     def mc_server(self):
@@ -298,6 +301,10 @@ class ServerInstance:
                 with self.state_lock:
                     self.state["events"].append({"time": ts, "player": e.group("player"), "msg": e.group("msg")})
                     if len(self.state["events"]) > 200: self.state["events"].pop(0)
+            lag = CANT_KEEP_UP_RE.search(line)
+            if lag:
+                self._last_lag_time    = time.time()
+                self._last_ticks_behind = int(lag.group(1))
 
     def start(self):
         self.ready_event.clear()
@@ -495,7 +502,11 @@ class ServerInstance:
                     self.state["latency"]     = round(s.latency, 1)
                     self.state["version"]     = s.version.name if s.version else ""
                     self.state["motd"]        = MOTD_RE.sub("", str(s.description)).strip()
-                    tps = max(0, min(20, 20 - (s.latency / 50)))
+                    lag_age = time.time() - self._last_lag_time
+                    if lag_age < self.scfg["check_interval"] * 2:
+                        tps = max(0.0, min(20.0, 20.0 - (self._last_ticks_behind / self.scfg["check_interval"])))
+                    else:
+                        tps = 20.0
                     self.state["tps"] = round(tps, 2)
                     with self.state_lock:
                         self.state["history"].append(self.state["tps"])
