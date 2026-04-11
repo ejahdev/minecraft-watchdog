@@ -42,6 +42,7 @@ DEFAULT_SERVER_CFG = {
     "max_startup_wait": 300,
     "backup_interval":  1800,
     "restart_interval": 21600,
+    "restarts_enabled": True,
     "restart_warning_times": [600, 300, 60],
     "max_crashes":      5,
     "crash_window":     300,
@@ -229,7 +230,8 @@ class ServerInstance:
             "chat":          [],
             "events":        [],
             "log":           [],
-            "backups_enabled": scfg.get("backups_enabled", True),
+            "backups_enabled":  scfg.get("backups_enabled", True),
+            "restarts_enabled": scfg.get("restarts_enabled", True),
             "crash_count":   0,
             "motd":          "",
             "version":       "",
@@ -244,8 +246,9 @@ class ServerInstance:
         self.save_done_event  = threading.Event()
         self._last_cmd_time   = 0.0
         self._mc_server       = None
-        self._last_lag_time   = 0.0
+        self._last_lag_time     = 0.0
         self._last_ticks_behind = 0
+        self.next_restart_at    = None
 
     @property
     def mc_server(self):
@@ -403,14 +406,19 @@ class ServerInstance:
         self.send_command("bossbar remove watchdog:restart")
 
     def restart_scheduler(self):
-        interval     = self.scfg.get("restart_interval", 21600)
-        warning_times = sorted(self.scfg.get("restart_warning_times", [600, 300, 60]), reverse=True)
-        max_warning  = warning_times[0] if warning_times else 0
-
-        # Sleep until the first warning window begins
-        time.sleep(max(0, interval - max_warning))
-
         while True:
+            interval      = self.scfg.get("restart_interval", 21600)
+            warning_times = sorted(self.scfg.get("restart_warning_times", [600, 300, 60]), reverse=True)
+            max_warning   = warning_times[0] if warning_times else 0
+
+            self.next_restart_at = time.time() + interval
+            time.sleep(max(0, interval - max_warning))
+
+            if not self.state.get("restarts_enabled", True):
+                self._log("RESTART_SCHED", "Scheduled restart skipped (auto-restarts disabled)")
+                self.next_restart_at = None
+                continue
+
             self._log("RESTART_SCHED", "Scheduled restart warning sequence started")
 
             # Send bossbar updates at each configured warning time
@@ -434,9 +442,6 @@ class ServerInstance:
             if self.proc and self.proc.poll() is None:
                 self._log("RESTART_SCHED", "Performing scheduled restart")
                 threading.Thread(target=self.stop, daemon=True).start()
-
-            # Sleep until next warning window
-            time.sleep(max(0, interval - max_warning))
 
     def monitor(self):
         self._log("WATCHDOG", "Watchdog started")
@@ -861,13 +866,23 @@ main{max-width:1200px;margin:0 auto;padding:24px}
       <button class="btn btn-red"    id="btnStop"    onclick="act('stop')"    style="display:none">&#9632; Stop</button>
       <button class="btn btn-green"  id="btnBackup"  onclick="act('backup')">&#8659; Backup Now</button>
       <button class="btn btn-toggle on" id="btnToggle" onclick="toggleBackups()">Auto-Backup: ON</button>
+      <button class="btn btn-toggle on" id="btnRestartToggle" onclick="toggleRestarts()">Auto-Restart: ON</button>
+      <div style="display:flex;align-items:center;gap:6px;background:#21262d;border:1px solid #30363d;border-radius:6px;padding:4px 10px">
+        <input type="number" id="restartIntervalHours" min="0.5" max="720" step="0.5" value="6"
+          style="width:52px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.82rem;padding:3px 6px;text-align:center">
+        <span style="color:#8b949e;font-size:.8rem;white-space:nowrap">hr restart</span>
+        <button class="btn-sm" style="background:#238636;color:#fff;border:none" onclick="setRestartInterval()">Set</button>
+      </div>
     </div>
   </div>
 
   <div class="section">
     <div class="section-header">
       <div class="section-title">Recent Backups</div>
-      <div class="countdown" id="backupCountdown"></div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+        <div class="countdown" id="backupCountdown"></div>
+        <span class="countdown" id="restartCountdown"></span>
+      </div>
     </div>
     <table class="backup-table">
       <thead><tr><th>File</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead>
@@ -1065,6 +1080,21 @@ async function poll(){
     tb.className='btn btn-toggle '+(backupsEnabled?'on':'off');
     tb.textContent='Auto-Backup: '+(backupsEnabled?'ON':'OFF');
 
+    const reEnabled=data.restarts_enabled;
+    const rb=document.getElementById('btnRestartToggle');
+    rb.className='btn btn-toggle '+(reEnabled?'on':'off');
+    rb.textContent='Auto-Restart: '+(reEnabled?'ON':'OFF');
+    if(data.restart_interval!=null){
+      document.getElementById('restartIntervalHours').value=Math.round(data.restart_interval/3600*10)/10;
+    }
+    const rc=document.getElementById('restartCountdown');
+    if(data.restarts_enabled&&data.next_restart_in!=null){
+      const s=data.next_restart_in;
+      const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+      rc.textContent=s===0?'Restarting\u2026':(h?'Next restart: '+h+'h '+m+'m':'Next restart: '+m+'m '+sec+'s');
+      rc.className='countdown'+(s===0?' due':'');
+    }else{rc.textContent='';rc.className='countdown';}
+
     const cd=document.getElementById('backupCountdown');
     if(data.backups_enabled&&data.next_backup_in!=null){
       cd.textContent=fmtCountdown(data.next_backup_in);
@@ -1098,6 +1128,23 @@ async function toggleBackups(){
   try{
     const r=await fetch('/server/'+currentSid+'/toggle_backups').then(r=>r.json());
     toast('Auto-backup '+(r.enabled?'enabled':'disabled'),'info');
+  }catch(e){toast('Failed','err');}
+}
+async function toggleRestarts(){
+  try{
+    const r=await fetch('/server/'+currentSid+'/toggle_restarts').then(r=>r.json());
+    toast('Auto-restart '+(r.enabled?'enabled':'disabled'),'info');
+  }catch(e){toast('Failed','err');}
+}
+async function setRestartInterval(){
+  const hours=parseFloat(document.getElementById('restartIntervalHours').value);
+  if(isNaN(hours)||hours<0.5){toast('Enter a valid number of hours (min 0.5)','err');return;}
+  try{
+    const r=await fetch('/server/'+currentSid+'/set_restart_interval',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({hours})
+    }).then(r=>r.json());
+    if(r.error){toast(r.error,'err');}else{toast('Restart interval set to '+hours+'h','ok');}
   }catch(e){toast('Failed','err');}
 }
 async function fetchMe(){
@@ -1752,6 +1799,11 @@ def api(sid):
             data["next_backup_in"] = bi
         else:
             data["next_backup_in"] = None
+        data["restart_interval"] = srv.scfg.get("restart_interval", 21600)
+        if data.get("restarts_enabled") and srv.next_restart_at is not None:
+            data["next_restart_in"] = max(0, int(srv.next_restart_at - time.time()))
+        else:
+            data["next_restart_in"] = None
         return jsonify(data)
     except Exception as e:
         log_event("ERROR", f"/api/{sid} failed: {e}")
@@ -1895,6 +1947,36 @@ def toggle_backups(sid):
     srv.scfg["backups_enabled"]  = srv.state["backups_enabled"]
     save_config(cfg)
     return jsonify({"enabled": srv.state["backups_enabled"]})
+
+@app.route("/server/<int:sid>/toggle_restarts")
+@require_auth
+def toggle_restarts(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
+    srv.state["restarts_enabled"] = not srv.state.get("restarts_enabled", True)
+    srv.scfg["restarts_enabled"]  = srv.state["restarts_enabled"]
+    save_config(cfg)
+    return jsonify({"enabled": srv.state["restarts_enabled"]})
+
+@app.route("/server/<int:sid>/set_restart_interval", methods=["POST"])
+@require_auth
+def set_restart_interval(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
+    hours = request.json.get("hours") if request.json else None
+    try:
+        hours = float(hours)
+        if hours < 0.5 or hours > 720:
+            return jsonify({"error": "hours must be between 0.5 and 720"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid hours value"}), 400
+    srv.scfg["restart_interval"] = int(hours * 3600)
+    save_config(cfg)
+    return jsonify({"restart_interval": srv.scfg["restart_interval"]})
 
 @app.route("/server/<int:sid>/start")
 @require_auth
