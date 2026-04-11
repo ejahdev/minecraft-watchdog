@@ -148,7 +148,17 @@ pip install mcstatus psutil flask waitress
 | URL | Page |
 |-----|------|
 | `http://localhost:5000/` | Overview — stats, charts, actions, chat |
+| `http://localhost:5000/stats` | Stats — entity/chunk counts, quick commands |
+| `http://localhost:5000/whitelist` | Whitelist — view, add, and remove whitelisted players |
 | `http://localhost:5000/console` | Console — server log, watchdog log, command input |
 | `http://localhost:5000/admin` | Admin — user management |
 | `http://localhost:5000/login` | Login |
 | `http://localhost:5000/logout` | Logout |
+
+---
+
+## Contributors
+
+| Contributor | Contribution |
+|-------------|-------------|
+| TheSatiricalEmperor | Stats page (`/stats`) and Whitelist page (`/whitelist`) |

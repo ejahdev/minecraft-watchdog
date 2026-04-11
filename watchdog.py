@@ -1,4 +1,4 @@
-import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac, zipfile, concurrent.futures
+import os, time, subprocess, shutil, datetime, threading, re, secrets, json, hashlib, hmac as _hmac, zipfile, concurrent.futures, urllib.request, urllib.parse
 from functools import wraps
 from mcstatus import JavaServer
 import psutil
@@ -49,6 +49,8 @@ DEFAULT_SERVER_CFG = {
     "world_dir":        "world",
     "backup_dir":       "backups",
     "backups_enabled":  True,
+    "spark_stats_enabled": True,
+    "spark_report_interval": 300,
     "users":            [],
 }
 
@@ -149,6 +151,7 @@ ANSI_RE         = re.compile(r'\x1b\[[0-9;]*m')
 MOTD_RE         = re.compile(r'\u00a7.')
 CANT_KEEP_UP_RE = re.compile(r"Can't keep up!.*?Running \d+ms or (\d+) ticks behind")
 STATS_RE        = re.compile(r'(?i)entities?[:\s=]+(\d+).*?chunks?[:\s=]+(\d+)|chunks?[:\s=]+(\d+).*?entities?[:\s=]+(\d+)')
+SPARK_URL_RE    = re.compile(r'(https?://spark\.lucko\.me/\S+)')
 EVENT_RE = re.compile(
     r'\[.+?/INFO\].*?:\s'
     r'(?:\[.*?\]\s)*(?P<player>\w+)\s(?P<msg>'
@@ -237,6 +240,9 @@ class ServerInstance:
             "loaded_chunks":    None,
             "stats_updated":    None,
             "stats_source":     None,
+            "spark_url":       None,
+            "spark_report_updated": None,
+            "spark_stats_enabled": scfg.get("spark_stats_enabled", True),
             "crash_count":   0,
             "motd":          "",
             "version":       "",
@@ -254,6 +260,7 @@ class ServerInstance:
         self._last_lag_time     = 0.0
         self._last_ticks_behind = 0
         self.next_restart_at    = None
+        self._spark_fetching    = False
 
     @property
     def mc_server(self):
@@ -286,6 +293,154 @@ class ServerInstance:
                     continue
             resolved.append(arg)
         return resolved
+
+
+    def _extract_first_number(self, value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            return int(value)
+        if isinstance(value, str):
+            m = re.search(r'(\d[\d,]*)', value)
+            if m:
+                try:
+                    return int(m.group(1).replace(",", ""))
+                except Exception:
+                    return None
+        return None
+
+    def _search_spark_report(self, node, path="root", found=None):
+        if found is None:
+            found = {"entities": [], "chunks": []}
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kp = f"{path}.{k}"
+                kl = str(k).lower()
+                if "entity" in kl:
+                    n = self._extract_first_number(v)
+                    if n is not None:
+                        found["entities"].append((kp, n))
+                if "chunk" in kl:
+                    n = self._extract_first_number(v)
+                    if n is not None:
+                        found["chunks"].append((kp, n))
+                self._search_spark_report(v, kp, found)
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                self._search_spark_report(item, f"{path}[{i}]", found)
+        return found
+
+    def _fetch_spark_report(self, url):
+        if self._spark_fetching:
+            return
+        self._spark_fetching = True
+        try:
+            raw_url = url + ('&raw=1' if '?' in url else '?raw=1')
+            req = urllib.request.Request(raw_url, headers={"User-Agent": "Minecraft-Watchdog/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            data = json.loads(body)
+            found = self._search_spark_report(data)
+            entity_val = max((n for _, n in found["entities"]), default=None)
+            chunk_val = max((n for _, n in found["chunks"]), default=None)
+            ts_now = datetime.datetime.now().strftime("%H:%M:%S")
+            with self.state_lock:
+                self.state["spark_url"] = url
+                self.state["spark_report_updated"] = ts_now
+                if entity_val is not None:
+                    self.state["entity_count"] = entity_val
+                if chunk_val is not None:
+                    self.state["loaded_chunks"] = chunk_val
+                if entity_val is not None or chunk_val is not None:
+                    parts = []
+                    if entity_val is not None:
+                        parts.append(f"Entities: {entity_val}")
+                    if chunk_val is not None:
+                        parts.append(f"Loaded Chunks: {chunk_val}")
+                    self.state["stats_updated"] = ts_now
+                    self.state["stats_source"] = "Spark report parsed — " + " | ".join(parts)
+            self._log("SPARK", f"Fetched spark report ({'ok' if entity_val is not None or chunk_val is not None else 'no stats found'})")
+        except Exception as e:
+            self._log("SPARK", f"Failed to fetch spark report: {e}")
+        finally:
+            self._spark_fetching = False
+
+    def spark_report_scheduler(self):
+        while True:
+            interval = max(60, int(self.scfg.get("spark_report_interval", 300)))
+            time.sleep(interval)
+            enabled = self.scfg.get("spark_stats_enabled", True)
+            with self.state_lock:
+                self.state["spark_stats_enabled"] = enabled
+            if not enabled:
+                continue
+            if self.state.get("status") != "online":
+                continue
+            if self.send_command("spark health --upload --memory"):
+                self._log("SPARK", "Requested spark health report upload")
+
+    def whitelist_file_path(self):
+        return os.path.join(self.server_dir, "whitelist.json")
+
+    def load_whitelist(self):
+        path = self.whitelist_file_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            rows = []
+            if isinstance(data, list):
+                rows = data
+            elif isinstance(data, dict):
+                for key in ("players", "entries", "whitelist"):
+                    if isinstance(data.get(key), list):
+                        rows = data.get(key)
+                        break
+
+            cleaned = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = str(
+                    row.get("name")
+                    or row.get("username")
+                    or row.get("player")
+                    or row.get("profileName")
+                    or ""
+                ).strip()
+                uuid = str(
+                    row.get("uuid")
+                    or row.get("id")
+                    or row.get("profileId")
+                    or ""
+                ).strip()
+                cleaned.append({
+                    "uuid": uuid,
+                    "name": name
+                })
+
+            cleaned = [r for r in cleaned if r["name"] or r["uuid"]]
+            cleaned.sort(key=lambda x: (x["name"] or x["uuid"]).lower())
+            return cleaned
+        except Exception as e:
+            self._log("WHITELIST", f"Failed to read whitelist.json: {e}")
+        return []
+
+    def save_whitelist(self, entries):
+        path = self.whitelist_file_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2)
+            return True, None
+        except Exception as e:
+            self._log("WHITELIST", f"Failed to write whitelist.json: {e}")
+            return False, str(e)
 
     def read_output(self):
         for raw in self.proc.stdout:
@@ -325,6 +480,13 @@ class ServerInstance:
                     self.state["loaded_chunks"] = chunks
                     self.state["stats_updated"] = ts_now
                     self.state["stats_source"]  = line
+            um = SPARK_URL_RE.search(line)
+            if um:
+                spark_url = um.group(1).rstrip(').,')
+                with self.state_lock:
+                    self.state["spark_url"] = spark_url
+                    self.state["spark_report_updated"] = datetime.datetime.now().strftime("%H:%M:%S")
+                threading.Thread(target=self._fetch_spark_report, args=(spark_url,), daemon=True).start()
 
     def start(self):
         self.ready_event.clear()
@@ -612,6 +774,7 @@ _HEADER_HTML = """
   <nav>
     <a class="nav-link{dash_active}" href="/">Overview</a>
     <a class="nav-link{stats_active}" href="/stats">Stats</a>
+    <a class="nav-link{wl_active}" href="/whitelist" id="wlLink">Whitelist</a>
     <a class="nav-link{con_active}" href="/console" id="conLink">Console</a>
     <a class="nav-link{adm_active}" href="/admin" id="adminLink" style="display:none">Users</a>
   </nav>
@@ -814,7 +977,7 @@ main{max-width:1200px;margin:0 auto;padding:24px}
 </style>
 </head>
 <body>
-""" + _HEADER_HTML.replace("{dash_active}", " active").replace("{stats_active}", "").replace("{con_active}", "").replace("{adm_active}", "") + """
+""" + _HEADER_HTML.replace("{dash_active}", " active").replace("{stats_active}", "").replace("{wl_active}", "").replace("{con_active}", "").replace("{adm_active}", "") + """
 <main>
   <div id="crashBanner">&#9888; Server has crashed too many times and stopped restarting. It will retry automatically.</div>
   <div id="errBar" style="display:none;background:#1a0a0a;border:1px solid #f85149;border-radius:8px;padding:14px 18px;margin-bottom:20px;font-size:.85rem;color:#f85149"></div>
@@ -1172,10 +1335,11 @@ async function fetchMe(){
     if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':d.role==='admin'?' \u00b7 admin':'');
     const al=document.getElementById('adminLink');
     if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
-    // Hide console nav entirely for pure viewers (no admin role on any server)
     if(d.role!=='admin'&&d.role!=='owner'){
       const cl=document.getElementById('conLink');
       if(cl)cl.style.display='none';
+      const wl=document.getElementById('wlLink');
+      if(wl)wl.style.display='none';
     }
   }catch(e){}
 }
@@ -1224,7 +1388,7 @@ main{max-width:1100px;margin:0 auto;padding:24px}
 </style>
 </head>
 <body>
-""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", " active").replace("{con_active}", "").replace("{adm_active}", "") + """
+""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", " active").replace("{wl_active}", "").replace("{con_active}", "").replace("{adm_active}", "") + """
 <main>
   <div class="stats-hero">
     <div class="card">
@@ -1235,23 +1399,29 @@ main{max-width:1100px;margin:0 auto;padding:24px}
     <div class="card">
       <div class="card-label">Loaded Chunks</div>
       <div class="card-value" id="chunkCount">&mdash;</div>
-      <div class="card-sub">Parsed from recent server log output</div>
+      <div class="card-sub">Pulled from spark report data when available</div>
     </div>
     <div class="card">
       <div class="card-label">Server Status</div>
       <div class="card-value" id="statusValue">&mdash;</div>
       <div class="card-sub" id="serverNameLine">Loading&hellip;</div>
     </div>
+    <div class="card">
+      <div class="card-label">Auto Restart</div>
+      <div class="card-value" id="autoRestartValue">&mdash;</div>
+      <div class="card-sub" id="nextRestartLine">Checking&hellip;</div>
+    </div>
   </div>
 
   <div class="section">
-    <div class="section-title">Latest Matching Log Line</div>
-    <div class="source-box" id="statsSource">No matching chunk/entity lines seen yet.</div>
+    <div class="section-title">Latest Stats Source</div>
+    <div class="source-box" id="statsSource">No spark report data seen yet.</div>
   </div>
 
   <div class="section" id="statsActionsSection">
     <div class="section-title">Quick Commands</div>
     <div class="actions">
+      <button class="btn btn-green" onclick="quickCmd('spark health --upload --memory')">Run Spark Refresh</button>
       <button class="btn btn-green" onclick="quickCmd('save-all')">Save World</button>
       <button class="btn btn-green" onclick="quickCmd('list')">List Players</button>
       <button class="btn btn-green" onclick="quickCmd('whitelist on')">Whitelist On</button>
@@ -1261,9 +1431,14 @@ main{max-width:1100px;margin:0 auto;padding:24px}
   </div>
 
   <div class="section">
+    <div class="section-title">Latest Spark Report</div>
+    <div class="source-box" id="sparkUrl">No spark report URL seen yet.</div>
+  </div>
+
+  <div class="section">
     <div class="section-title">What this page is showing</div>
     <div class="note">
-      This page is a lightweight runtime view pulled from recent log lines the watchdog has already seen. It is handy for spotting obvious chunk or entity spikes without stuffing the main overview page full of admin-only detail.
+      This page prefers spark report data automatically. It will fetch the latest spark report URL, try to parse raw report JSON, and fall back to any matching live console lines if spark has not produced a report yet.
     </div>
   </div>
 </main>
@@ -1290,6 +1465,12 @@ function selectServer(sid){
   _applyServerRole(sid);
   poll();
 }
+function fmtTimer(s){
+  if(s===null||s===undefined) return '';
+  if(s<=0) return 'Restarting…';
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+  return h ? ('Next restart: '+h+'h '+m+'m') : ('Next restart: '+m+'m '+sec+'s');
+}
 async function poll(){
   try{
     const r=await fetch('/api/'+currentSid);
@@ -1300,9 +1481,21 @@ async function poll(){
     document.getElementById('entityCount').textContent=fmtNum(data.entity_count);
     document.getElementById('chunkCount').textContent=fmtNum(data.loaded_chunks);
     document.getElementById('statsUpdated').textContent=data.stats_updated?('Last seen: '+data.stats_updated):'Waiting for data\u2026';
-    document.getElementById('statsSource').textContent=data.stats_source||'No matching chunk/entity lines seen yet.';
+    document.getElementById('statsSource').textContent=data.stats_source||'No spark report data seen yet.';
     document.getElementById('statusValue').textContent=(data.status||'offline').toUpperCase();
     document.getElementById('serverNameLine').textContent=(data.motd||'')+((data.version)?(' \u2022 v'+data.version):'');
+    const autoVal=document.getElementById('autoRestartValue');
+    const nextLine=document.getElementById('nextRestartLine');
+    if(autoVal){
+      const enabled=!!data.restarts_enabled;
+      autoVal.textContent=enabled?'ON':'OFF';
+      autoVal.style.color=enabled?'#3fb950':'#f85149';
+    }
+    if(nextLine){
+      nextLine.textContent=(data.restarts_enabled && data.next_restart_in!=null) ? fmtTimer(data.next_restart_in) : 'Scheduled restarts disabled';
+    }
+    const sparkUrlEl=document.getElementById('sparkUrl');
+    if(sparkUrlEl) sparkUrlEl.textContent=data.spark_url||'No spark report URL seen yet.';
     document.getElementById('lastUpdate').textContent=new Date().toLocaleTimeString();
   }catch(e){
     toast('Stats poll failed','err');
@@ -1325,6 +1518,8 @@ async function fetchMe(){
     if(d.role!=='admin'&&d.role!=='owner'){
       const cl=document.getElementById('conLink');
       if(cl)cl.style.display='none';
+      const wl=document.getElementById('wlLink');
+      if(wl)wl.style.display='none';
     }
   }catch(e){}
 }
@@ -1384,7 +1579,7 @@ header{flex-shrink:0}
 </style>
 </head>
 <body>
-""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", "").replace("{con_active}", " active").replace("{adm_active}", "") + """
+""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", "").replace("{wl_active}", "").replace("{con_active}", " active").replace("{adm_active}", "") + """
 <div class="console-wrap">
   <div class="page-tabs">
     <button class="page-tab active" onclick="switchPage('server',this)">Server Log</button>
@@ -1447,6 +1642,10 @@ function wlogClass(line){
 }
 function renderLog(lines){
   const log=document.getElementById('consoleLog');
+  if(lines.length<lastLogLen){
+    lastLogLen=0;
+    log.innerHTML='';
+  }
   if(lines.length===lastLogLen)return;
   const atBottom=log.scrollHeight-log.scrollTop<=log.clientHeight+10;
   lines.slice(lastLogLen).forEach(function(text){
@@ -1460,6 +1659,10 @@ function renderLog(lines){
 }
 function renderWatchdogLog(lines){
   const log=document.getElementById('watchdogLog');
+  if(lines.length<wlogLen){
+    wlogLen=0;
+    log.innerHTML='';
+  }
   if(lines.length===wlogLen)return;
   const atBottom=log.scrollHeight-log.scrollTop<=log.clientHeight+10;
   lines.slice(wlogLen).forEach(function(text){
@@ -1504,14 +1707,14 @@ function switchPage(name,btn){
 }
 async function poll(){
   try{
-    const data=await fetch('/api/'+currentSid+'/log').then(r=>r.json());
+    const data=await fetch('/api/'+currentSid+'/log?_='+Date.now(), {cache:'no-store'}).then(r=>r.json());
     updateStatus(data.status);
     renderLog(data.log||[]);
   }catch(e){}
 }
 async function pollWatchdogLog(){
   try{
-    const data=await fetch('/api/watchdog_log').then(r=>r.json());
+    const data=await fetch('/api/watchdog_log?_='+Date.now(), {cache:'no-store'}).then(r=>r.json());
     renderWatchdogLog(data.lines||[]);
   }catch(e){}
 }
@@ -1556,6 +1759,10 @@ async function fetchMe(){
     if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':d.role==='admin'?' \u00b7 admin':'');
     const al=document.getElementById('adminLink');
     if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
+    if(d.role!=='admin'&&d.role!=='owner'){
+      const wl=document.getElementById('wlLink');
+      if(wl)wl.style.display='none';
+    }
   }catch(e){}
 }
 fetchMe(); loadServerBar(); poll(); setInterval(poll,2000); setInterval(pollWatchdogLog,10000); setInterval(refreshServerBar,10000);
@@ -1602,7 +1809,7 @@ select.form-input{cursor:pointer}
 </style>
 </head>
 <body>
-""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", "").replace("{con_active}", "").replace("{adm_active}", " active") + """
+""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", "").replace("{wl_active}", "").replace("{con_active}", "").replace("{adm_active}", " active") + """
 <main>
 
   <!-- Global Accounts — owner only, shown via JS -->
@@ -1654,9 +1861,7 @@ async function fetchMe(){
     const d=await fetch('/api/me').then(r=>r.json());
     _me=d.username; _myRole=d.role;
     const ub=document.getElementById('userBadge');
-    if(ub) ub.textContent=_me+(_myRole==='owner'?' \u00b7 owner':' \u00b7 admin');
-    const al=document.getElementById('adminLink');
-    if(al) al.style.display='';
+    if(ub) ub.textContent=_me+(_myRole==='owner'?' \u00b7 owner':_myRole==='admin'?' \u00b7 admin':'');
     if(_myRole==='owner'){
       document.getElementById('globalSection').style.display='';
       document.getElementById('addUserSection').style.display='';
@@ -1852,6 +2057,156 @@ if(_sp)_sp.style.display='none';
 </body>
 </html>"""
 
+
+# ── Whitelist page ─────────────────────────────────────────────────────────────
+WHITELIST_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ATMons &mdash; Whitelist</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='%2358a6ff'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EA%3C/text%3E%3C/svg%3E">
+<style>
+""" + _HEAD_CSS + """
+main{max-width:1000px;margin:0 auto;padding:24px}
+.section{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:20px}
+.section-title{font-size:.72rem;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:16px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.input{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 12px;color:#e6edf3;font-size:.9rem;min-width:280px;outline:none}
+.input:focus{border-color:#58a6ff}
+.btn{padding:9px 18px;border:none;border-radius:6px;cursor:pointer;font-size:.85rem;font-weight:500;display:inline-flex;align-items:center;gap:7px;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn-green{background:#238636;color:#fff}
+.btn-red{background:#da3633;color:#fff}
+.tbl{width:100%;border-collapse:collapse;font-size:.85rem}
+.tbl th{text-align:left;color:#8b949e;font-weight:500;padding:8px 10px;border-bottom:1px solid #21262d}
+.tbl td{padding:10px;border-bottom:1px solid #0d1117;color:#c9d1d9;vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.mono{font-family:'Consolas','Courier New',monospace;font-size:.8rem;color:#8b949e}
+.note{font-size:.82rem;color:#8b949e;margin-top:10px;line-height:1.55}
+.empty{color:#484f58;padding:10px}
+</style>
+</head>
+<body>
+""" + _HEADER_HTML.replace("{dash_active}", "").replace("{stats_active}", "").replace("{wl_active}", " active").replace("{con_active}", "").replace("{adm_active}", "") + """
+<main>
+  <div class="section">
+    <div class="section-title">Add Player</div>
+    <div class="row">
+      <input id="wlName" class="input" placeholder="Minecraft username">
+      <button class="btn btn-green" onclick="addWhitelist()">Add to Whitelist</button>
+    </div>
+    <div class="note">Adds the player using the server command when the server is online, then refreshes the saved whitelist file view.</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Current Whitelist</div>
+    <table class="tbl">
+      <thead><tr><th>Name</th><th>UUID</th><th>Actions</th></tr></thead>
+      <tbody id="wlTable"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+""" + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
+function _applyServerRole(sid){}
+function selectServer(sid){
+  currentSid=sid;
+  document.querySelectorAll('.srv-tab').forEach(function(t){t.classList.toggle('active',t.id==='srvTab'+sid);});
+  poll();
+}
+function renderWhitelist(items){
+  const tb=document.getElementById('wlTable');
+  if(!items || !items.length){
+    tb.innerHTML='<tr><td colspan="3" class="empty">Nobody on the whitelist yet.</td></tr>';
+    return;
+  }
+  tb.innerHTML=items.map(function(p){
+    const safeName=(p.name||'').replace(/'/g,"&#39;");
+    return `<tr><td>${p.name||''}</td><td class="mono">${p.uuid||''}</td><td><button class="btn btn-red" onclick="removeWhitelist('${safeName}')">Remove</button></td></tr>`;
+  }).join('');
+}
+async function poll(){
+  try{
+    const [statusResp, wlResp] = await Promise.all([
+      fetch('/api/'+currentSid+'?_='+Date.now(), {cache:'no-store'}),
+      fetch('/api/'+currentSid+'/whitelist?_='+Date.now(), {cache:'no-store'})
+    ]);
+
+    if(statusResp.status===401 || wlResp.status===401){
+      window.location='/login';
+      return;
+    }
+
+    const statusData = await statusResp.json();
+    const wlData = await wlResp.json();
+
+    if(!statusData.error){
+      updateStatus(statusData.status);
+    }
+
+    if(wlData.error){
+      toast('Whitelist: '+wlData.error,'err');
+      const tb=document.getElementById('wlTable');
+      if(tb) tb.innerHTML='<tr><td colspan="3" class="empty">Failed to load whitelist.</td></tr>';
+    } else {
+      renderWhitelist(Array.isArray(wlData.players) ? wlData.players : []);
+    }
+  }catch(e){
+    toast('Failed to load whitelist','err');
+  }
+}
+async function addWhitelist(){
+  const inp=document.getElementById('wlName');
+  const name=inp.value.trim();
+  if(!name){toast('Enter a username','err');return;}
+  try{
+    const r=await fetch('/api/'+currentSid+'/whitelist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(r=>r.json());
+    if(r.ok){
+      toast(r.message||('Added '+name),'ok');
+      inp.value='';
+      setTimeout(poll,2500);
+    }else{
+      toast(r.error||'Failed','err');
+    }
+  }catch(e){toast('Failed to add player','err');}
+}
+async function removeWhitelist(name){
+  if(!confirm('Remove '+name+' from whitelist?')) return;
+  try{
+    const r=await fetch('/api/'+currentSid+'/whitelist/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}).then(r=>r.json());
+    if(r.ok){
+      toast(r.message||('Removed '+name),'ok');
+      setTimeout(poll,800);
+    }else{
+      toast(r.error||'Failed','err');
+    }
+  }catch(e){toast('Failed to remove player','err');}
+}
+async function fetchMe(){
+  try{
+    const d=await fetch('/api/me').then(r=>r.json());
+    const ub=document.getElementById('userBadge');
+    if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':d.role==='admin'?' \u00b7 admin':'');
+    const al=document.getElementById('adminLink');
+    if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
+    if(d.role!=='admin'&&d.role!=='owner'){
+      const cl=document.getElementById('conLink');
+      if(cl)cl.style.display='none';
+      const wl=document.getElementById('wlLink');
+      if(wl)wl.style.display='none';
+    }
+  }catch(e){}
+}
+fetchMe(); loadServerBar(); poll();
+setInterval(poll,5000); setInterval(refreshServerBar,10000);
+</script>
+</body>
+</html>"""
+
 # ── Apply server_name branding ─────────────────────────────────────────────────
 _sn = cfg.get("server_name") or "Minecraft Watchdog"
 LOGIN_HTML     = LOGIN_HTML    .replace("ATMons", _sn)
@@ -1859,6 +2214,7 @@ DASHBOARD_HTML = DASHBOARD_HTML.replace("ATMons", _sn)
 STATS_HTML     = STATS_HTML    .replace("ATMons", _sn)
 CONSOLE_HTML   = CONSOLE_HTML  .replace("ATMons", _sn)
 ADMIN_HTML     = ADMIN_HTML    .replace("ATMons", _sn)
+WHITELIST_HTML = WHITELIST_HTML.replace("ATMons", _sn)
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 _MAX_ATTEMPTS = 5
@@ -1922,6 +2278,12 @@ def stats_page():
 def console():
     return CONSOLE_HTML
 
+
+@app.route("/whitelist")
+@require_role("admin", "owner")
+def whitelist_page():
+    return WHITELIST_HTML
+
 @app.route("/admin")
 @require_role("admin", "owner")
 def admin_page():
@@ -1964,6 +2326,8 @@ def api(sid):
         else:
             data["next_backup_in"] = None
         data["restart_interval"] = srv.scfg.get("restart_interval", 21600)
+        data["spark_stats_enabled"] = srv.scfg.get("spark_stats_enabled", True)
+        data["spark_report_interval"] = srv.scfg.get("spark_report_interval", 300)
         if data.get("restarts_enabled") and srv.next_restart_at is not None:
             data["next_restart_in"] = max(0, int(srv.next_restart_at - time.time()))
         else:
@@ -2048,6 +2412,62 @@ def delete_backup(sid, filename):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/<int:sid>/whitelist")
+@require_auth
+def api_whitelist(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"error": "forbidden"}), 403
+    resp = jsonify({"players": srv.load_whitelist()})
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
+@app.route("/api/<int:sid>/whitelist/add", methods=["POST"])
+@require_auth
+def api_whitelist_add(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,16}", name):
+        return jsonify({"ok": False, "error": "Enter a valid Minecraft username"}), 400
+    if not srv.proc or srv.proc.poll() is not None:
+        return jsonify({"ok": False, "error": "Server must be online to add new whitelist players"}), 400
+    if not srv.send_command(f"whitelist add {name}"):
+        return jsonify({"ok": False, "error": "Failed to send whitelist command"}), 500
+    srv._log("WHITELIST", f"Requested add for {name}")
+    return jsonify({"ok": True, "message": f"Sent whitelist add for {name}. Refreshing list..."})
+
+@app.route("/api/<int:sid>/whitelist/remove", methods=["POST"])
+@require_auth
+def api_whitelist_remove(sid):
+    srv, err = _get_server(sid)
+    if err: return err
+    if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Missing name"}), 400
+    entries = srv.load_whitelist()
+    new_entries = [e for e in entries if e.get("name","").lower() != name.lower()]
+    if len(new_entries) == len(entries):
+        return jsonify({"ok": False, "error": "Player not found in whitelist"}), 404
+    ok, err_msg = srv.save_whitelist(new_entries)
+    if not ok:
+        return jsonify({"ok": False, "error": err_msg or "Failed to save whitelist"}), 500
+    if srv.proc and srv.proc.poll() is None:
+        srv.send_command(f"whitelist remove {name}")
+        srv.send_command("whitelist reload")
+    srv._log("WHITELIST", f"Removed {name}")
+    return jsonify({"ok": True, "message": f"Removed {name} from whitelist"})
 
 @app.route("/server/<int:sid>/command", methods=["POST"])
 @require_auth
@@ -2300,6 +2720,7 @@ if __name__ == "__main__":
         threading.Thread(target=srv.monitor,            daemon=True).start()
         threading.Thread(target=srv.backup_scheduler,  daemon=True).start()
         threading.Thread(target=srv.restart_scheduler, daemon=True).start()
+        threading.Thread(target=srv.spark_report_scheduler, daemon=True).start()
         log_event("WATCHDOG", f"[{srv.name}] Instance initialised (dir: {srv.server_dir})")
 
     sn = cfg.get("server_name") or "Minecraft Watchdog"
