@@ -150,7 +150,8 @@ DONE_RE         = re.compile(r'Done \(')
 ANSI_RE         = re.compile(r'\x1b\[[0-9;]*m')
 MOTD_RE         = re.compile(r'\u00a7.')
 CANT_KEEP_UP_RE = re.compile(r"Can't keep up!.*?Running \d+ms or (\d+) ticks behind")
-STATS_RE        = re.compile(r'(?i)entities?[:\s=]+(\d+).*?chunks?[:\s=]+(\d+)|chunks?[:\s=]+(\d+).*?entities?[:\s=]+(\d+)')
+ENTITY_TOTAL_RE = re.compile(r'\]:\s*(\d+)\s+Entities\s*$')
+CHUNK_COUNT_RE  = re.compile(r'\]:\s*(ENTITY_TICKING|FULL|BLOCK_TICKING):\s+(\d+)')
 SPARK_URL_RE    = re.compile(r'(https?://spark\.lucko\.me/\S+)')
 EVENT_RE = re.compile(
     r'\[.+?/INFO\].*?:\s'
@@ -257,10 +258,12 @@ class ServerInstance:
         self.save_done_event  = threading.Event()
         self._last_cmd_time   = 0.0
         self._mc_server       = None
-        self._last_lag_time     = 0.0
-        self._last_ticks_behind = 0
-        self.next_restart_at    = None
-        self._spark_fetching    = False
+        self._last_lag_time       = 0.0
+        self._last_ticks_behind   = 0
+        self.next_restart_at      = None
+        self._spark_fetching      = False
+        self._chunk_counts        = {}
+        self._last_stats_cmd_time = 0.0
 
     @property
     def mc_server(self):
@@ -468,18 +471,21 @@ class ServerInstance:
             if lag:
                 self._last_lag_time    = time.time()
                 self._last_ticks_behind = int(lag.group(1))
-            sm = STATS_RE.search(line)
-            if sm:
-                if sm.group(1) is not None:
-                    entities, chunks = int(sm.group(1)), int(sm.group(2))
-                else:
-                    chunks, entities = int(sm.group(3)), int(sm.group(4))
+            em = ENTITY_TOTAL_RE.search(line)
+            if em:
                 ts_now = datetime.datetime.now().strftime("%H:%M:%S")
                 with self.state_lock:
-                    self.state["entity_count"]  = entities
-                    self.state["loaded_chunks"] = chunks
+                    self.state["entity_count"]  = int(em.group(1))
                     self.state["stats_updated"] = ts_now
                     self.state["stats_source"]  = line
+            cm = CHUNK_COUNT_RE.search(line)
+            if cm:
+                self._chunk_counts[cm.group(1)] = int(cm.group(2))
+                total = sum(self._chunk_counts.get(k, 0) for k in ("ENTITY_TICKING", "FULL", "BLOCK_TICKING"))
+                ts_now = datetime.datetime.now().strftime("%H:%M:%S")
+                with self.state_lock:
+                    self.state["loaded_chunks"] = total
+                    self.state["stats_updated"] = ts_now
             um = SPARK_URL_RE.search(line)
             if um:
                 spark_url = um.group(1).rstrip(').,')
@@ -696,6 +702,10 @@ class ServerInstance:
                         self.state["history"].append(self.state["tps"])
                         if len(self.state["history"]) > 50: self.state["history"].pop(0)
                     failures = 0
+                    if time.time() - self._last_stats_cmd_time > 30:
+                        self.send_command("cu entities entityData")
+                        self.send_command("cu chunks")
+                        self._last_stats_cmd_time = time.time()
                 except Exception as _poll_exc:
                     failures += 1
                     self._log("POLL_FAIL", f"Status check failed (failures={failures}): {type(_poll_exc).__name__}: {_poll_exc}")
@@ -1421,6 +1431,8 @@ main{max-width:1100px;margin:0 auto;padding:24px}
   <div class="section" id="statsActionsSection">
     <div class="section-title">Quick Commands</div>
     <div class="actions">
+      <button class="btn btn-green" onclick="quickCmd('cu entities entityData')">Refresh Entities</button>
+      <button class="btn btn-green" onclick="quickCmd('cu chunks')">Refresh Chunks</button>
       <button class="btn btn-green" onclick="quickCmd('spark health --upload --memory')">Run Spark Refresh</button>
       <button class="btn btn-green" onclick="quickCmd('save-all')">Save World</button>
       <button class="btn btn-green" onclick="quickCmd('list')">List Players</button>
