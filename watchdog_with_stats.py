@@ -42,7 +42,7 @@ DEFAULT_SERVER_CFG = {
     "max_startup_wait": 300,
     "backup_interval":  1800,
     "restart_interval": 21600,
-    "restarts_enabled": True,
+    "auto_restart_enabled": True,
     "restart_warning_times": [600, 300, 60],
     "max_crashes":      5,
     "crash_window":     300,
@@ -148,7 +148,6 @@ DONE_RE         = re.compile(r'Done \(')
 ANSI_RE         = re.compile(r'\x1b\[[0-9;]*m')
 MOTD_RE         = re.compile(r'\u00a7.')
 CANT_KEEP_UP_RE = re.compile(r"Can't keep up!.*?Running \d+ms or (\d+) ticks behind")
-STATS_RE        = re.compile(r'(?i)entities?[:\s=]+(\d+).*?chunks?[:\s=]+(\d+)|chunks?[:\s=]+(\d+).*?entities?[:\s=]+(\d+)')
 EVENT_RE = re.compile(
     r'\[.+?/INFO\].*?:\s'
     r'(?:\[.*?\]\s)*(?P<player>\w+)\s(?P<msg>'
@@ -231,12 +230,8 @@ class ServerInstance:
             "chat":          [],
             "events":        [],
             "log":           [],
-            "backups_enabled":  scfg.get("backups_enabled", True),
-            "restarts_enabled": scfg.get("restarts_enabled", True),
-            "entity_count":     None,
-            "loaded_chunks":    None,
-            "stats_updated":    None,
-            "stats_source":     None,
+            "backups_enabled": scfg.get("backups_enabled", True),
+            "auto_restart_enabled": scfg.get("auto_restart_enabled", True),
             "crash_count":   0,
             "motd":          "",
             "version":       "",
@@ -251,9 +246,11 @@ class ServerInstance:
         self.save_done_event  = threading.Event()
         self._last_cmd_time   = 0.0
         self._mc_server       = None
-        self._last_lag_time     = 0.0
+        self._last_lag_time   = 0.0
         self._last_ticks_behind = 0
-        self.next_restart_at    = None
+        self.next_restart_at  = time.time() + max(60, int(self.scfg.get("restart_interval", 21600) or 21600)) if self.scfg.get("auto_restart_enabled", True) else None
+        self._restart_warned  = set()
+        self._restart_interval_cache = int(self.scfg.get("restart_interval", 21600) or 21600)
 
     @property
     def mc_server(self):
@@ -313,18 +310,6 @@ class ServerInstance:
             if lag:
                 self._last_lag_time    = time.time()
                 self._last_ticks_behind = int(lag.group(1))
-            sm = STATS_RE.search(line)
-            if sm:
-                if sm.group(1) is not None:
-                    entities, chunks = int(sm.group(1)), int(sm.group(2))
-                else:
-                    chunks, entities = int(sm.group(3)), int(sm.group(4))
-                ts_now = datetime.datetime.now().strftime("%H:%M:%S")
-                with self.state_lock:
-                    self.state["entity_count"]  = entities
-                    self.state["loaded_chunks"] = chunks
-                    self.state["stats_updated"] = ts_now
-                    self.state["stats_source"]  = line
 
     def start(self):
         self.ready_event.clear()
@@ -422,43 +407,61 @@ class ServerInstance:
     def clear_restart_bossbar(self):
         self.send_command("bossbar remove watchdog:restart")
 
+    def reschedule_restart(self, announce=False):
+        interval = max(60, int(self.scfg.get("restart_interval", 21600) or 21600))
+        self.scfg["restart_interval"] = interval
+        self._restart_interval_cache = interval
+        self.next_restart_at = time.time() + interval if self.scfg.get("auto_restart_enabled", True) else None
+        self._restart_warned.clear()
+        if self.state.get("auto_restart_enabled") != self.scfg.get("auto_restart_enabled", True):
+            self.state["auto_restart_enabled"] = self.scfg.get("auto_restart_enabled", True)
+        if announce:
+            self._log("RESTART_SCHED", f"Restart timer reset to {interval}s")
+
     def restart_scheduler(self):
         while True:
-            interval      = self.scfg.get("restart_interval", 21600)
-            warning_times = sorted(self.scfg.get("restart_warning_times", [600, 300, 60]), reverse=True)
-            max_warning   = warning_times[0] if warning_times else 0
+            try:
+                enabled = bool(self.scfg.get("auto_restart_enabled", True))
+                interval = max(60, int(self.scfg.get("restart_interval", 21600) or 21600))
+                self.state["auto_restart_enabled"] = enabled
 
-            self.next_restart_at = time.time() + interval
-            time.sleep(max(0, interval - max_warning))
+                if interval != self._restart_interval_cache:
+                    self.reschedule_restart(announce=True)
 
-            if not self.state.get("restarts_enabled", True):
-                self._log("RESTART_SCHED", "Scheduled restart skipped (auto-restarts disabled)")
-                self.next_restart_at = None
-                continue
+                if not enabled:
+                    if self.next_restart_at is not None:
+                        self.next_restart_at = None
+                        self._restart_warned.clear()
+                        self.clear_restart_bossbar()
+                        self._log("RESTART_SCHED", "Auto restart disabled")
+                    time.sleep(1)
+                    continue
 
-            self._log("RESTART_SCHED", "Scheduled restart warning sequence started")
+                if self.next_restart_at is None:
+                    self.reschedule_restart(announce=True)
 
-            # Send bossbar updates at each configured warning time
-            prev_seconds = max_warning
-            for seconds in warning_times:
-                gap = prev_seconds - seconds
-                if gap > 0:
-                    time.sleep(gap)
-                if self.state["status"] == "online":
-                    self.bossbar_warning(seconds)
-                prev_seconds = seconds
+                remaining = max(0, int(self.next_restart_at - time.time()))
+                warning_times = sorted(set(int(x) for x in self.scfg.get("restart_warning_times", [600, 300, 60]) if int(x) > 0), reverse=True)
 
-            # Sleep the remaining gap to reach t=0
-            if prev_seconds > 0:
-                time.sleep(prev_seconds)
+                for seconds in warning_times:
+                    if remaining <= seconds and seconds not in self._restart_warned:
+                        self._restart_warned.add(seconds)
+                        if self.state["status"] == "online":
+                            self.bossbar_warning(seconds)
+                            self._log("RESTART_SCHED", f"Restart warning sent for T-{seconds}s")
 
-            self.clear_restart_bossbar()
-            if self.state["status"] == "online":
-                self.send_command('tellraw @a {"text":"[Watchdog] Server is restarting now!","color":"red"}')
+                if remaining <= 0:
+                    self.clear_restart_bossbar()
+                    if self.state["status"] == "online":
+                        self.send_command('tellraw @a {"text":"[Watchdog] Server is restarting now!","color":"red"}')
+                    if self.proc and self.proc.poll() is None:
+                        self._log("RESTART_SCHED", "Performing scheduled restart")
+                        threading.Thread(target=self.stop, daemon=True).start()
+                    self.reschedule_restart(announce=True)
 
-            if self.proc and self.proc.poll() is None:
-                self._log("RESTART_SCHED", "Performing scheduled restart")
-                threading.Thread(target=self.stop, daemon=True).start()
+            except Exception as e:
+                self._log("ERROR", f"Restart scheduler failed: {e}")
+            time.sleep(1)
 
     def monitor(self):
         self._log("WATCHDOG", "Watchdog started")
@@ -884,22 +887,18 @@ main{max-width:1200px;margin:0 auto;padding:24px}
       <button class="btn btn-red"    id="btnStop"    onclick="act('stop')"    style="display:none">&#9632; Stop</button>
       <button class="btn btn-green"  id="btnBackup"  onclick="act('backup')">&#8659; Backup Now</button>
       <button class="btn btn-toggle on" id="btnToggle" onclick="toggleBackups()">Auto-Backup: ON</button>
-      <button class="btn btn-toggle on" id="btnRestartToggle" onclick="toggleRestarts()">Auto-Restart: ON</button>
-      <div style="display:flex;align-items:center;gap:6px;background:#21262d;border:1px solid #30363d;border-radius:6px;padding:4px 10px">
-        <input type="number" id="restartIntervalHours" min="0.5" max="720" step="0.5" value="6"
-          style="width:52px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;font-size:.82rem;padding:3px 6px;text-align:center">
-        <span style="color:#8b949e;font-size:.8rem;white-space:nowrap">hr restart</span>
-        <button class="btn-sm" style="background:#238636;color:#fff;border:none" onclick="setRestartInterval()">Set</button>
-      </div>
+      <button class="btn btn-toggle on" id="btnRestartToggle" onclick="toggleAutoRestart()">Auto-Restart: ON</button>
+      <input id="restartHours" type="number" min="0.1" step="0.5" style="width:110px;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:9px 12px;color:#e6edf3;font-size:.85rem" placeholder="Hours">
+      <button class="btn btn-green" id="btnRestartSave" onclick="saveRestartInterval()">Save Restart Time</button>
     </div>
   </div>
 
   <div class="section">
     <div class="section-header">
       <div class="section-title">Recent Backups</div>
-      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+        <div class="countdown" id="restartCountdown"></div>
         <div class="countdown" id="backupCountdown"></div>
-        <span class="countdown" id="restartCountdown"></span>
       </div>
     </div>
     <table class="backup-table">
@@ -924,7 +923,7 @@ main{max-width:1200px;margin:0 auto;padding:24px}
 
 <script>
 const MAX_RAM=8;
-let charts={}, lastChatLen=0, lastEventLen=0, backupsEnabled=true, lastPollOk=Date.now();
+let charts={}, lastChatLen=0, lastEventLen=0, backupsEnabled=true, autoRestartEnabled=true, lastPollOk=Date.now();
 """ + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
 function _applyServerRole(sid){
   const role=_serverRoles[sid];
@@ -1098,26 +1097,25 @@ async function poll(){
     tb.className='btn btn-toggle '+(backupsEnabled?'on':'off');
     tb.textContent='Auto-Backup: '+(backupsEnabled?'ON':'OFF');
 
-    const reEnabled=data.restarts_enabled;
-    const rb=document.getElementById('btnRestartToggle');
-    rb.className='btn btn-toggle '+(reEnabled?'on':'off');
-    rb.textContent='Auto-Restart: '+(reEnabled?'ON':'OFF');
-    if(data.restart_interval!=null){
-      document.getElementById('restartIntervalHours').value=Math.round(data.restart_interval/3600*10)/10;
-    }
-    const rc=document.getElementById('restartCountdown');
-    if(data.restarts_enabled&&data.next_restart_in!=null){
-      const s=data.next_restart_in;
-      const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
-      rc.textContent=s===0?'Restarting\u2026':(h?'Next restart: '+h+'h '+m+'m':'Next restart: '+m+'m '+sec+'s');
-      rc.className='countdown'+(s===0?' due':'');
-    }else{rc.textContent='';rc.className='countdown';}
-
     const cd=document.getElementById('backupCountdown');
     if(data.backups_enabled&&data.next_backup_in!=null){
       cd.textContent=fmtCountdown(data.next_backup_in);
       cd.className='countdown'+(data.next_backup_in===0?' due':'');
     }else{cd.textContent='';cd.className='countdown';}
+
+    autoRestartEnabled=data.auto_restart_enabled;
+    const rt=document.getElementById('btnRestartToggle');
+    rt.className='btn btn-toggle '+(autoRestartEnabled?'on':'off');
+    rt.textContent='Auto-Restart: '+(autoRestartEnabled?'ON':'OFF');
+    const rh=document.getElementById('restartHours');
+    if(rh && document.activeElement!==rh){
+      rh.value=(Math.round(((data.restart_interval||21600)/3600)*100)/100).toString();
+    }
+    const rc=document.getElementById('restartCountdown');
+    if(data.auto_restart_enabled&&data.next_restart_in!=null){
+      rc.textContent='Next restart: '+fmtUptime(data.next_restart_in);
+      rc.className='countdown'+(data.next_restart_in===0?' due':'');
+    }else{rc.textContent='Auto-restart off';rc.className='countdown';}
 
     lastPollOk=Date.now();
     const lu=document.getElementById('lastUpdate');
@@ -1148,21 +1146,26 @@ async function toggleBackups(){
     toast('Auto-backup '+(r.enabled?'enabled':'disabled'),'info');
   }catch(e){toast('Failed','err');}
 }
-async function toggleRestarts(){
+async function toggleAutoRestart(){
   try{
-    const r=await fetch('/server/'+currentSid+'/toggle_restarts').then(r=>r.json());
+    const r=await fetch('/server/'+currentSid+'/toggle_auto_restart').then(r=>r.json());
     toast('Auto-restart '+(r.enabled?'enabled':'disabled'),'info');
+    poll();
   }catch(e){toast('Failed','err');}
 }
-async function setRestartInterval(){
-  const hours=parseFloat(document.getElementById('restartIntervalHours').value);
-  if(isNaN(hours)||hours<0.5){toast('Enter a valid number of hours (min 0.5)','err');return;}
+async function saveRestartInterval(){
+  const input=document.getElementById('restartHours');
+  const hours=parseFloat(input.value);
+  if(!hours||hours<=0){toast('Enter restart hours','err');return;}
   try{
     const r=await fetch('/server/'+currentSid+'/set_restart_interval',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({hours})
     }).then(r=>r.json());
-    if(r.error){toast(r.error,'err');}else{toast('Restart interval set to '+hours+'h','ok');}
+    if(r.ok===false){toast(r.error||'Failed','err');return;}
+    toast('Restart interval updated','info');
+    poll();
   }catch(e){toast('Failed','err');}
 }
 async function fetchMe(){
@@ -1230,7 +1233,7 @@ main{max-width:1100px;margin:0 auto;padding:24px}
     <div class="card">
       <div class="card-label">Entities</div>
       <div class="card-value" id="entityCount">&mdash;</div>
-      <div class="card-sub" id="statsUpdated">Waiting for data&hellip;</div>
+      <div class="card-sub" id="statsUpdated">Waiting for data…</div>
     </div>
     <div class="card">
       <div class="card-label">Loaded Chunks</div>
@@ -1240,7 +1243,7 @@ main{max-width:1100px;margin:0 auto;padding:24px}
     <div class="card">
       <div class="card-label">Server Status</div>
       <div class="card-value" id="statusValue">&mdash;</div>
-      <div class="card-sub" id="serverNameLine">Loading&hellip;</div>
+      <div class="card-sub" id="serverNameLine">Loading…</div>
     </div>
   </div>
 
@@ -1274,7 +1277,7 @@ main{max-width:1100px;margin:0 auto;padding:24px}
 <script>
 """ + _STATUS_JS + _TOAST_JS + _SERVER_BAR_JS + """
 function fmtNum(v){
-  if(v===null||v===undefined) return '\u2014';
+  if(v===null||v===undefined) return '—';
   return Number(v).toLocaleString();
 }
 function _applyServerRole(sid){
@@ -1299,10 +1302,10 @@ async function poll(){
     updateStatus(data.status);
     document.getElementById('entityCount').textContent=fmtNum(data.entity_count);
     document.getElementById('chunkCount').textContent=fmtNum(data.loaded_chunks);
-    document.getElementById('statsUpdated').textContent=data.stats_updated?('Last seen: '+data.stats_updated):'Waiting for data\u2026';
+    document.getElementById('statsUpdated').textContent=data.stats_updated?('Last seen: '+data.stats_updated):'Waiting for data…';
     document.getElementById('statsSource').textContent=data.stats_source||'No matching chunk/entity lines seen yet.';
     document.getElementById('statusValue').textContent=(data.status||'offline').toUpperCase();
-    document.getElementById('serverNameLine').textContent=(data.motd||'')+((data.version)?(' \u2022 v'+data.version):'');
+    document.getElementById('serverNameLine').textContent=(data.motd||'') + ((data.version)?(' • v'+data.version):'');
     document.getElementById('lastUpdate').textContent=new Date().toLocaleTimeString();
   }catch(e){
     toast('Stats poll failed','err');
@@ -1319,7 +1322,7 @@ async function fetchMe(){
   try{
     const d=await fetch('/api/me').then(r=>r.json());
     const ub=document.getElementById('userBadge');
-    if(ub) ub.textContent=d.username+(d.role==='owner'?' \u00b7 owner':d.role==='admin'?' \u00b7 admin':'');
+    if(ub) ub.textContent=d.username+(d.role==='owner'?' · owner':d.role==='admin'?' · admin':'');
     const al=document.getElementById('adminLink');
     if(al&&(d.role==='admin'||d.role==='owner')) al.style.display='';
     if(d.role!=='admin'&&d.role!=='owner'){
@@ -1963,9 +1966,12 @@ def api(sid):
             data["next_backup_in"] = bi
         else:
             data["next_backup_in"] = None
-        data["restart_interval"] = srv.scfg.get("restart_interval", 21600)
-        if data.get("restarts_enabled") and srv.next_restart_at is not None:
+        data["restart_interval"] = int(srv.scfg.get("restart_interval", 21600) or 21600)
+        data["auto_restart_enabled"] = bool(srv.scfg.get("auto_restart_enabled", True))
+        if data["auto_restart_enabled"] and srv.next_restart_at:
             data["next_restart_in"] = max(0, int(srv.next_restart_at - time.time()))
+        elif data["auto_restart_enabled"]:
+            data["next_restart_in"] = data["restart_interval"]
         else:
             data["next_restart_in"] = None
         return jsonify(data)
@@ -2060,7 +2066,7 @@ def command(sid):
     if now - srv._last_cmd_time < 0.5:
         return jsonify({"ok": False, "error": "Too fast, slow down"}), 429
     srv._last_cmd_time = now
-    cmd = (request.json.get("command") or request.json.get("cmd", "")).strip()
+    cmd = request.json.get("cmd", "").strip()
     if not cmd: return jsonify({"ok": False, "error": "Empty command"}), 400
     if not srv.proc or srv.proc.poll() is not None:
         return jsonify({"ok": False, "error": "Server not running"}), 400
@@ -2087,6 +2093,7 @@ def restart(sid):
     if err: return err
     if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
         return jsonify({"error": "forbidden"}), 403
+    srv.reschedule_restart(announce=True)
     threading.Thread(target=srv.stop, daemon=True).start()
     return "restarting"
 
@@ -2112,17 +2119,22 @@ def toggle_backups(sid):
     save_config(cfg)
     return jsonify({"enabled": srv.state["backups_enabled"]})
 
-@app.route("/server/<int:sid>/toggle_restarts")
+@app.route("/server/<int:sid>/toggle_auto_restart")
 @require_auth
-def toggle_restarts(sid):
+def toggle_auto_restart(sid):
     srv, err = _get_server(sid)
     if err: return err
     if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
         return jsonify({"error": "forbidden"}), 403
-    srv.state["restarts_enabled"] = not srv.state.get("restarts_enabled", True)
-    srv.scfg["restarts_enabled"]  = srv.state["restarts_enabled"]
+    srv.scfg["auto_restart_enabled"] = not bool(srv.scfg.get("auto_restart_enabled", True))
+    srv.state["auto_restart_enabled"] = srv.scfg["auto_restart_enabled"]
+    srv.reschedule_restart(announce=True)
+    if not srv.scfg["auto_restart_enabled"]:
+        srv.next_restart_at = None
+        srv._restart_warned.clear()
+        srv.clear_restart_bossbar()
     save_config(cfg)
-    return jsonify({"enabled": srv.state["restarts_enabled"]})
+    return jsonify({"enabled": srv.scfg["auto_restart_enabled"]})
 
 @app.route("/server/<int:sid>/set_restart_interval", methods=["POST"])
 @require_auth
@@ -2131,16 +2143,18 @@ def set_restart_interval(sid):
     if err: return err
     if _get_server_role(session.get("username"), srv) not in ("admin", "owner"):
         return jsonify({"error": "forbidden"}), 403
-    hours = request.json.get("hours") if request.json else None
     try:
-        hours = float(hours)
-        if hours < 0.5 or hours > 720:
-            return jsonify({"error": "hours must be between 0.5 and 720"}), 400
-    except (TypeError, ValueError):
-        return jsonify({"error": "invalid hours value"}), 400
-    srv.scfg["restart_interval"] = int(hours * 3600)
+        data = request.get_json(silent=True) or {}
+        hours = float(data.get("hours", 0))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid value"}), 400
+    if hours <= 0:
+        return jsonify({"ok": False, "error": "Hours must be more than 0"}), 400
+    seconds = max(60, int(hours * 3600))
+    srv.scfg["restart_interval"] = seconds
+    srv.reschedule_restart(announce=True)
     save_config(cfg)
-    return jsonify({"restart_interval": srv.scfg["restart_interval"]})
+    return jsonify({"ok": True, "restart_interval": seconds, "hours": round(seconds / 3600, 2)})
 
 @app.route("/server/<int:sid>/start")
 @require_auth
@@ -2157,6 +2171,7 @@ def start_server(sid):
     if srv.proc and srv.proc.poll() is None:
         srv.proc.kill()
     srv.restart_event.set()
+    srv.reschedule_restart(announce=True)
     srv._log("START", "Manual start requested from dashboard")
     return "starting"
 
