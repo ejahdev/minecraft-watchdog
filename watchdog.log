@@ -1,6 +1,0 @@
-[2026-04-11 00:18:01] [CONFIG] Migrated to multi-server config format
-[2026-04-11 00:18:01] [SETUP] Default credentials: admin / changeme — change immediately
-[2026-04-11 00:18:01] [WATCHDOG] [My Server] Watchdog started
-[2026-04-11 00:18:01] [WATCHDOG] [My Server] Instance initialised (dir: C:\Users\Ejah\Desktop\minecraft_watchdog)
-[2026-04-11 00:18:01] [WATCHDOG] Minecraft Watchdog starting up — 1 server(s)
-[2026-04-11 00:18:01] [WATCHDOG] Dashboard running at http://0.0.0.0:5000
