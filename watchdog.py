@@ -43,7 +43,6 @@ DEFAULT_SERVER_CFG = {
     "backup_interval":  1800,
     "restart_interval": 21600,
     "restarts_enabled": True,
-    "restart_warning_times": [600, 300, 60],
     "max_crashes":      5,
     "crash_window":     300,
     "world_dir":        "world",
@@ -575,29 +574,16 @@ class ServerInstance:
             self._log("COMMAND", f"Failed to send command '{cmd}': {e}")
         return False
 
-    def bossbar_warning(self, seconds_left):
-        title = f"Server restarting in {seconds_left} seconds"
-        progress = max(0.0, min(1.0, seconds_left / max(self.scfg["restart_warning_times"])))
-        self.send_command('bossbar add watchdog:restart {"text":"Server Restart","color":"red"}')
-        self.send_command(f'bossbar set watchdog:restart name {{"text":"{title}","color":"red"}}')
-        self.send_command("bossbar set watchdog:restart color red")
-        self.send_command("bossbar set watchdog:restart style progress")
-        self.send_command("bossbar set watchdog:restart max 100")
-        self.send_command(f"bossbar set watchdog:restart value {int(progress * 100)}")
-        self.send_command("bossbar set watchdog:restart players @a")
-        self.send_command(f'tellraw @a {{"text":"[Watchdog] {title}","color":"gold"}}')
-
     def clear_restart_bossbar(self):
         self.send_command("bossbar remove watchdog:restart")
 
     def restart_scheduler(self):
         while True:
-            interval      = self.scfg.get("restart_interval", 21600)
-            warning_times = sorted(self.scfg.get("restart_warning_times", [600, 300, 60]), reverse=True)
-            max_warning   = warning_times[0] if warning_times else 0
+            interval = self.scfg.get("restart_interval", 21600)
 
             self.next_restart_at = time.time() + interval
-            time.sleep(max(0, interval - max_warning))
+            # Sleep until 10 minutes before restart
+            time.sleep(max(0, interval - 600))
 
             if not self.state.get("restarts_enabled", True):
                 self._log("RESTART_SCHED", "Scheduled restart skipped (auto-restarts disabled)")
@@ -606,19 +592,34 @@ class ServerInstance:
 
             self._log("RESTART_SCHED", "Scheduled restart warning sequence started")
 
-            # Send bossbar updates at each configured warning time
-            prev_seconds = max_warning
-            for seconds in warning_times:
-                gap = prev_seconds - seconds
-                if gap > 0:
-                    time.sleep(gap)
-                if self.state["status"] == "online":
-                    self.bossbar_warning(seconds)
-                prev_seconds = seconds
+            # 10-minute chat warning
+            if self.state["status"] == "online":
+                self.send_command('tellraw @a {"text":"[Watchdog] Server restarting in 10 minutes.","color":"gold"}')
 
-            # Sleep the remaining gap to reach t=0
-            if prev_seconds > 0:
-                time.sleep(prev_seconds)
+            # Sleep until 5 minutes before restart
+            time.sleep(300)
+
+            # 5-minute chat warning
+            if self.state["status"] == "online":
+                self.send_command('tellraw @a {"text":"[Watchdog] Server restarting in 5 minutes.","color":"gold"}')
+
+            # Sleep until 60 seconds before restart
+            time.sleep(240)
+
+            # Show bossbar and count down every second for 60 seconds
+            if self.state["status"] == "online":
+                self.send_command('bossbar add watchdog:restart {"text":"Server Restart","color":"red"}')
+                self.send_command("bossbar set watchdog:restart color red")
+                self.send_command("bossbar set watchdog:restart style progress")
+                self.send_command("bossbar set watchdog:restart max 60")
+                self.send_command("bossbar set watchdog:restart players @a")
+
+            for seconds_left in range(60, 0, -1):
+                if self.state["status"] == "online":
+                    title = f"Server restarting in {seconds_left} seconds"
+                    self.send_command(f'bossbar set watchdog:restart name {{"text":"{title}","color":"red"}}')
+                    self.send_command(f"bossbar set watchdog:restart value {seconds_left}")
+                time.sleep(1)
 
             self.clear_restart_bossbar()
             if self.state["status"] == "online":
