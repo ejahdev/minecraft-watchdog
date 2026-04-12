@@ -263,6 +263,7 @@ class ServerInstance:
         self._spark_fetching      = False
         self._chunk_counts        = {}
         self._last_stats_cmd_time = 0.0
+        self._intentional_stop    = False
 
     @property
     def mc_server(self):
@@ -505,11 +506,15 @@ class ServerInstance:
 
     def stop(self):
         self._log("STOP", "Stop requested")
+        self._intentional_stop = True
+        proc = self.proc
+        if not proc:
+            return
         try:
-            self.proc.stdin.write(b"stop\n"); self.proc.stdin.flush()
-            self.proc.wait(timeout=30)
+            proc.stdin.write(b"stop\n"); proc.stdin.flush()
+            proc.wait(timeout=30)
         except Exception:
-            self.proc.kill()
+            proc.kill()
 
     def backup(self):
         backup_dir = os.path.join(self.server_dir, self.scfg["backup_dir"])
@@ -625,9 +630,20 @@ class ServerInstance:
             if self.state["status"] == "online":
                 self.send_command('tellraw @a {"text":"[Watchdog] Server is restarting now!","color":"red"}')
 
-            if self.proc and self.proc.poll() is None:
+            if self.proc and self.proc.poll() is None and self.state.get("status") == "online":
                 self._log("RESTART_SCHED", "Performing scheduled restart")
                 threading.Thread(target=self.stop, daemon=True).start()
+                # Wait for the server to go back online before scheduling the next restart
+                deadline = time.time() + self.scfg.get("max_startup_wait", 300) + 120
+                while time.time() < deadline:
+                    time.sleep(10)
+                    if self.state.get("status") == "online":
+                        self._log("RESTART_SCHED", "Server is back online after scheduled restart")
+                        break
+                else:
+                    self._log("RESTART_SCHED", "Server did not come back online within expected time after scheduled restart")
+            else:
+                self._log("RESTART_SCHED", "Skipping scheduled restart — server is not fully online (status: " + self.state.get("status", "unknown") + ")")
 
     def monitor(self):
         self._log("WATCHDOG", "Watchdog started")
@@ -654,6 +670,7 @@ class ServerInstance:
 
             if not self.ready_event.wait(timeout=self.scfg["max_startup_wait"]):
                 self.proc.kill()
+                self._intentional_stop = False
                 self.state["status"] = "offline"
                 self._log("CRASH", "Server did not start within timeout")
                 with self.state_lock: self.crash_times.append(time.time())
@@ -663,8 +680,12 @@ class ServerInstance:
 
             self._log("ONLINE", "Server is online")
             failures = 0
+            ever_online = False
             psproc   = psutil.Process(self.proc.pid)
             psproc.cpu_percent()
+
+            # Grace period: give the server time to accept connections after "Done"
+            time.sleep(self.scfg.get("startup_grace_period", 60))
 
             while self.proc.poll() is None:
                 self._log("POLL_DEBUG", f"loop tick — failures={failures}")
@@ -703,6 +724,7 @@ class ServerInstance:
                         self.state["history"].append(self.state["tps"])
                         if len(self.state["history"]) > 50: self.state["history"].pop(0)
                     failures = 0
+                    ever_online = True
                     if time.time() - self._last_stats_cmd_time > 30:
                         self.send_command("/cu entities entityData")
                         self.send_command("/cu chunks")
@@ -710,10 +732,17 @@ class ServerInstance:
                 except Exception as _poll_exc:
                     failures += 1
                     self._log("POLL_FAIL", f"Status check failed (failures={failures}): {type(_poll_exc).__name__}: {_poll_exc}")
-                    if failures >= 3: self.state["status"] = "offline"
-                    if failures >= 5:
-                        self._log("CRASH", "Server stopped responding")
-                        self.proc.kill(); break
+                    # Only mark offline/kill if the server was confirmed online at least once;
+                    # during early startup it may not be accepting connections yet
+                    if ever_online:
+                        if failures >= 3: self.state["status"] = "offline"
+                        if failures >= 8:
+                            self._log("CRASH", "Server stopped responding")
+                            self.proc.kill(); break
+                    else:
+                        if failures >= 12:
+                            self._log("CRASH", "Server never became reachable after startup")
+                            self.proc.kill(); break
 
                 try:
                     cpu = round(psproc.cpu_percent(), 1)
@@ -730,7 +759,10 @@ class ServerInstance:
             self.state["status"]      = "offline"
             self.state["player_list"] = []
             self._log("OFFLINE", "Server process ended")
-            with self.state_lock: self.crash_times.append(time.time())
+            was_intentional = self._intentional_stop
+            self._intentional_stop = False
+            if not was_intentional:
+                with self.state_lock: self.crash_times.append(time.time())
             self.restart_event.wait(timeout=5)
             self.restart_event.clear()
 
